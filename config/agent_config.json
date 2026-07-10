@@ -1,0 +1,85 @@
+{
+  "agent": {
+    "max_turns": 8,
+    "history_window": 10,
+    "trace_file": "web_agent_trace.jsonl"
+  },
+  "llm": {
+    "system_prompt": "你是一个网页浏览器自动化助手。根据任务使用工具操作网页并最终生成用户需要的结果。",
+    "max_tokens": 256
+  },
+  "prompt": {
+    "intro": "你是一个网页自动化 Agent。当前任务：",
+    "instructions": [
+      "请根据用户任务选择最合适的浏览器工具并输出 JSON 格式的动作结果。",
+      "返回结果必须是一个 JSON 对象，包含 thought、action、action_input 三个字段。",
+      "action 只能是以下工具名之一：browser_open、browser_observe、browser_click、browser_type、browser_select、browser_extract、browser_screenshot、finish。",
+      "action_input 如果有多个参数，请使用 JSON 字符串格式，例如 {\"url\": \"...\", \"selector\": \"...\"}。"
+    ],
+    "examples": [
+      "{\"thought\": \"先打开目标页面。\", \"action\": \"browser_open\", \"action_input\": \"{\\\"url\\\": \\\"https://example.com\\\"}\"}",
+      "{\"thought\": \"观察页面结构并获取可交互元素。\", \"action\": \"browser_observe\", \"action_input\": \"\"}",
+      "{\"thought\": \"点击搜索按钮并输入关键词。\", \"action\": \"browser_click\", \"action_input\": \"{\\\"selector\\\": \\\"text=Search\\\"}\"}"
+    ],
+    "closing": [
+      "如果任务完成，请直接使用 finish，并在 action_input 中给出最终结果。"
+    ]
+  },
+  "tools": {
+    "browser_open": {
+      "name": "browser_open",
+      "description": "打开指定 URL 并返回页面标题和当前 URL。",
+      "params": {"url": {"type": "string", "required": true, "description": "要打开的网页地址"}},
+      "input_param": "url",
+      "requires_confirmation": false
+    },
+    "browser_observe": {
+      "name": "browser_observe",
+      "description": "观察当前页面，返回 URL、标题、可见文本摘要和常见交互元素。",
+      "params": {},
+      "input_param": "",
+      "requires_confirmation": false
+    },
+    "browser_click": {
+      "name": "browser_click",
+      "description": "点击页面中的元素，支持 CSS 选择器或 text= 形式。",
+      "params": {"selector": {"type": "string", "required": true, "description": "要点击的元素选择器"}},
+      "input_param": "selector",
+      "requires_confirmation": false
+    },
+    "browser_type": {
+      "name": "browser_type",
+      "description": "在输入框中输入文本。",
+      "params": {
+        "selector": {"type": "string", "required": true, "description": "目标输入框选择器"},
+        "text": {"type": "string", "required": true, "description": "要输入的文本"}
+      },
+      "input_param": "text",
+      "requires_confirmation": false
+    },
+    "browser_select": {
+      "name": "browser_select",
+      "description": "选择下拉框选项。",
+      "params": {
+        "selector": {"type": "string", "required": true, "description": "下拉框选择器"},
+        "value": {"type": "string", "required": true, "description": "要选择的值"}
+      },
+      "input_param": "value",
+      "requires_confirmation": false
+    },
+    "browser_extract": {
+      "name": "browser_extract",
+      "description": "从当前页面提取指定信息，支持 selector: ... 形式。",
+      "params": {"instruction": {"type": "string", "required": true, "description": "提取说明，例如 selector: button"}},
+      "input_param": "instruction",
+      "requires_confirmation": false
+    },
+    "browser_screenshot": {
+      "name": "browser_screenshot",
+      "description": "保存当前页面截图并返回路径。",
+      "params": {},
+      "input_param": "",
+      "requires_confirmation": false
+    }
+  }
+}
