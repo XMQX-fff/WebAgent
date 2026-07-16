@@ -1,8 +1,8 @@
 {
   "agent": {
-    "max_turns": 8,
+    "max_turns": 16,
     "history_window": 10,
-    "trace_file": "web_agent_trace.jsonl"
+    "trace_file": "web_traces/web_agent_trace.jsonl"
   },
   "llm": {
     "system_prompt": "你是一个网页浏览器自动化助手。根据任务使用工具操作网页并最终生成用户需要的结果。",

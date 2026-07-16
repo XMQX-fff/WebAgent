@@ -60,12 +60,25 @@ class WebBrowser:
 
     def start(self):
         # 启动 Playwright 浏览器（懒加载），多次调用会重用同一 browser context
-        if self.page is not None:
-            return
         if sync_playwright is None:
             raise RuntimeError("缺少 playwright 依赖，请安装 playwright 并运行 `python -m playwright install chromium`。")
+
+        # 如果已有 page 且未关闭，则复用
+        try:
+            if self.page is not None and not getattr(self.page, "is_closed", lambda: False)():
+                return
+        except Exception:
+            # 若检查状态失败则继续创建新 page
+            pass
+
+        # 启动 playwright 并创建 browser/context/page
         self._playwright = sync_playwright().start()
-        self.browser = self._playwright.chromium.launch(headless=True)
+        headless_env = os.getenv("WEBAGENT_HEADLESS")
+        if headless_env is not None:
+            headless = headless_env.lower() not in ("0", "false", "no")
+        else:
+            headless = os.getenv("PWDEBUG") is None
+        self.browser = self._playwright.chromium.launch(headless=headless)
         self.context = self.browser.new_context()
         self.page = self.context.new_page()
 
@@ -139,14 +152,51 @@ class WebBrowser:
             self.start()
             url = self.page.url or "未打开页面"
             title = self.page.title() or "无标题"
-            # 获取 body 文本并截断，用于给模型快速阅读
+            # 获取 body 文本，用于自动摘要（严格限制长度以节省 token）
             body_text = self.page.locator("body").inner_text() or ""
-            visible_text_summary = body_text[:2000].replace("\n", " ").strip()
-            # 收集常见交互元素（a, button, input, textarea, select），限制最多 40 个
+            # 简单截断并做非常基础的句级摘要：优先保留前 600 字，尝试按句子分割以取前两句
+            raw = body_text.replace("\n", " ").strip()
+            if not raw:
+                visible_text_summary = ""
+            else:
+                max_chars = 600
+                if len(raw) <= max_chars:
+                    visible_text_summary = raw
+                else:
+                    # 尝试按中文句号或英文句号分割
+                    import re as _re
+                    sents = _re.split(r'(?<=[。\.\!\?])\s*', raw[: max_chars * 2])
+                    # 取前两句拼接，若不足再截断到 max_chars
+                    selected = "".join(s for s in sents if s)[:max_chars]
+                    visible_text_summary = selected
+
+            # 收集常见交互元素（a, button, input, textarea, select），采集更多字段便于构造精确选择器
             elements = self.page.eval_on_selector_all(
                 "a,button,input,textarea,select",
-                "els => els.slice(0, 40).map(el => ({ role: el.tagName.toLowerCase(), text: el.innerText || el.value || el.getAttribute('aria-label') || el.getAttribute('name') || '', selector: el.tagName.toLowerCase() }))"
+                "els => els.slice(0, 80).map(el => ({ role: el.tagName.toLowerCase(), id: el.id||'', name: el.getAttribute('name')||'', type: el.getAttribute('type')||'', aria_label: el.getAttribute('aria-label')||'', classes: el.className||'', text: (el.innerText||el.value||'').trim(), outer: (el.outerHTML||'').slice(0,300) }))"
             )
+            # 后处理：保留最多 20 个元素，文本截断到 120 字，移除过多空白
+            processed = []
+            for el in (elements or [])[:20]:
+                text = (el.get('text') or '')
+                text = re.sub(r"\s+", " ", text).strip()
+                if len(text) > 120:
+                    text = text[:117] + '...'
+                selector_sample = el.get('role')
+                if el.get('id'):
+                    selector_sample = f"#{el.get('id')}"
+                processed.append({
+                    'role': el.get('role'),
+                    'id': el.get('id'),
+                    'name': el.get('name'),
+                    'type': el.get('type'),
+                    'aria_label': el.get('aria_label'),
+                    'classes': el.get('classes'),
+                    'text': text,
+                    'selector_sample': selector_sample,
+                    'outer_html_snippet': el.get('outer')
+                })
+            elements = processed
             observation = {
                 "url": url,
                 "title": title,
@@ -161,10 +211,113 @@ class WebBrowser:
         # 点击页面元素，支持 text= 或 CSS 选择器
         try:
             self.start()
-            selector = self._resolve_selector(selector)
-            self.page.click(selector, timeout=10000)
-            self.page.wait_for_load_state("networkidle", timeout=8000)
-            return ToolResult(status="ok", data=f"已点击 {selector}，当前 URL {self.page.url}", meta={"url": self.page.url}).to_dict()
+            raw = selector.strip()
+
+            # helper: 点击 locator 并等待导航/网络空闲
+            def click_locator_and_wait(loc):
+                try:
+                    loc.scroll_into_view_if_needed()
+                except Exception:
+                    pass
+                loc.click(timeout=8000)
+                try:
+                    self.page.wait_for_load_state("networkidle", timeout=8000)
+                except Exception:
+                    pass
+
+            # 1) 如果是 id 选择器或含 '#'，优先按 id 定位
+            try_candidates = []
+            if raw.startswith('#') or re.match(r'^[A-Za-z0-9_\-]+$', raw):
+                # treat as id or plain token -> try id
+                if raw.startswith('#'):
+                    try_candidates.append(raw)
+                else:
+                    try_candidates.append(f"#{raw}")
+
+            # 2) 如果是 text=xxx, 提取文本
+            text_match = None
+            if raw.startswith('text='):
+                text_match = raw.split('=', 1)[1].strip()
+
+            # 3) 优先尝试按钮 role+name
+            if text_match:
+                try_candidates.append(('role_name', text_match))
+            else:
+                # 当传入为简单 'Login' 文本，也尝试 role+name
+                if not any(ch in raw for ch in ' #.>') and len(raw) < 60:
+                    try_candidates.append(('role_name', raw))
+
+            # 4) 尝试 button[type=submit] 或 button 有文本匹配
+            try_candidates.append('button[type="submit"]')
+            try_candidates.append('button')
+            try_candidates.append(raw)
+
+            last_err = None
+            debug_matches = []
+            for cand in try_candidates:
+                try:
+                    if isinstance(cand, tuple) and cand[0] == 'role_name':
+                        name = cand[1]
+                        loc = self.page.get_by_role('button', name=name)
+                        if loc.count() > 0:
+                            # pick first visible
+                            for i in range(loc.count()):
+                                l = loc.nth(i)
+                                if l.is_visible() and l.is_enabled():
+                                    click_locator_and_wait(l)
+                                    return ToolResult(status="ok", data=f"已点击 role button '{name}'，当前 URL {self.page.url}", meta={"url": self.page.url}).to_dict()
+                            debug_matches.append({'candidate': f"role button name={name}", 'count': loc.count()})
+                        else:
+                            debug_matches.append({'candidate': f"role button name={name}", 'count': 0})
+                        continue
+
+                    # cand is selector string
+                    sel = cand
+                    sel = self._resolve_selector(sel)
+                    loc = self.page.locator(sel)
+                    count = loc.count()
+                    debug_info = {'candidate': sel, 'count': count}
+                    if count == 0:
+                        debug_matches.append(debug_info)
+                        continue
+                    # 找到可见且可用的元素
+                    clicked = False
+                    for i in range(count):
+                        l = loc.nth(i)
+                        try:
+                            if l.is_visible() and l.is_enabled():
+                                click_locator_and_wait(l)
+                                return ToolResult(status="ok", data=f"已点击 {sel}（第{i}个匹配），当前 URL {self.page.url}", meta={"url": self.page.url}).to_dict()
+                        except Exception:
+                            continue
+                    # 记录匹配但未点击的信息（例如第一个元素不可见）
+                    # 尝试记录第一个元素的 outerHTML 片段
+                    try:
+                        outer = loc.nth(0).evaluate("el => el.outerHTML.slice(0,300)")
+                    except Exception:
+                        outer = ''
+                    debug_info['outer_html_snippet'] = outer
+                    debug_matches.append(debug_info)
+                except Exception as exc:
+                    last_err = exc
+                    continue
+
+            # 最后回退：尝试用 JS 在页面上查找按钮文本并触发 click
+            try:
+                if text_match:
+                    script = "(text) => { const els = Array.from(document.querySelectorAll('button,input[type=submit]')); for (const e of els) { if ((e.innerText||e.value||'').trim().includes(text)) { e.click(); return true; } } return false; }"
+                    ok = self.page.evaluate(script, text_match)
+                    if ok:
+                        try:
+                            self.page.wait_for_load_state("networkidle", timeout=8000)
+                        except Exception:
+                            pass
+                        return ToolResult(status="ok", data=f"已通过 JS 点击包含文本 '{text_match}' 的按钮，当前 URL {self.page.url}", meta={"url": self.page.url}).to_dict()
+            except Exception:
+                pass
+
+            # 如果都失败，返回带 debug_matches 的错误信息，便于 trace 分析
+            return ToolResult(status="error", error_code="TIMEOUT", error_msg=str(last_err) or "未找到可点击元素", suggestion="尝试更精确选择器，例如 #submit-login 或使用 role+name 定位。", meta={"candidates": debug_matches}).to_dict()
         except PlaywrightTimeoutError as exc:
             return ToolResult(status="error", error_code="TIMEOUT", error_msg=str(exc), suggestion="点击操作超时，可能没有找到元素。" ).to_dict()
         except Exception as exc:

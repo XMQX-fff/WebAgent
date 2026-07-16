@@ -16,7 +16,7 @@ except ImportError:
 # 可通过环境变量覆盖模型与 base_url
 OPENAI_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 OPENAI_DEFAULT_BASE_URL = "https://api.siliconflow.cn/v1"
-OPENAI_API_KEY = "sk-mlzdlapvxdvrcswumpevhzisuklmufoyayvnetrcrumqgjqo"
+
 
 
 def create_openai_client():
@@ -26,7 +26,9 @@ def create_openai_client():
     """
     if OpenAI is None:
         raise RuntimeError("缺少 openai 库，请安装 openai 包以调用大模型。")
-    api_key = "sk-mlzdlapvxdvrcswumpevhzisuklmufoyayvnetrcrumqgjqo"
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("未配置 OPENAI_API_KEY 系统环境变量")
     if not api_key:
         raise RuntimeError("请通过环境变量 OPENAI_API_KEY 提供 API Key。")
     return OpenAI(api_key=api_key, base_url=OPENAI_DEFAULT_BASE_URL)
