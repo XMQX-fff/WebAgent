@@ -54,7 +54,7 @@ class BaseReActAgent:
         self.max_tokens = config.get("llm", {}).get("max_tokens", 256)
 
     def add_trace(self, thought_summary: str, tool: Optional[str], args: Dict[str, Any], observation: str, cost_estimate: str):
-        """记录当前步骤 trace 并追加到文件。"""
+        """记录当前步骤 trace：追加到内存列表并写入 JSONL 文件。"""
         record = {
             "step": self.step_count,
             "thought_summary": thought_summary,
@@ -64,10 +64,6 @@ class BaseReActAgent:
             "cost_estimate": cost_estimate,
         }
         self.trace.append(record)
-        self._append_trace_file(record)
-
-    def _append_trace_file(self, record: Dict[str, Any]):
-        # 追加写入 trace 文件，供调试与复盘使用
         with open(self.trace_file, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
