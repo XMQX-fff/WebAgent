@@ -2,6 +2,11 @@
 
 此模块提供 `WebBrowser` 类封装常用浏览器操作工具函数，返回统一的 `ToolResult` 字典结构，
 以便上层 Agent 调用并将结果序列化写入 trace。模块内方法均对异常做友好降级并返回错误码与建议。
+
+支持浏览器状态持久化：通过 `state_file` 参数在浏览器启动时加载已保存的 cookies/localStorage，
+并在关闭时自动保存，方便跨任务复用登录态。
+
+此外还提供 `decide_state_from_task` 工具函数，通过 LLM 判断任务是否需要复用已保存的浏览器状态。
 """
 
 import json
@@ -9,7 +14,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 try:
     from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
@@ -43,23 +48,36 @@ class ToolResult:
 
 
 class WebBrowser:
-    """Playwright 浏览器封装。
+    """Playwright 浏览器封装，支持状态持久化。
 
-    提供 start/close 以及常用操作：open/observe/click/type/select/extract/screenshot。
+    提供 start/close 以及常用操作：open/observe/click/type/select/extract/screenshot/clear_state。
     所有操作均返回 `ToolResult.to_dict()` 便于与上层 Agent 集成。
+
+    状态持久化：
+    - 通过 `state_file` 指定状态文件路径
+    - `start(load_state=True)` 时自动加载已保存的 cookies/localStorage
+    - `close()` 时自动保存当前状态
+    - `browser_clear_state()` 清除当前状态并删除状态文件
     """
 
-    def __init__(self, trace_dir: str = "web_traces"):
+    def __init__(self, trace_dir: str = "web_traces", state_file: Optional[str] = None):
         # trace_dir: 存放截图等运行产物的目录
+        # state_file: 浏览器状态持久化文件路径（cookies/localStorage/sessionStorage）
         self.trace_dir = Path(trace_dir)
         self.trace_dir.mkdir(parents=True, exist_ok=True)
+        self.state_file = state_file
         self._playwright = None
         self.browser = None
         self.context = None
         self.page = None
 
-    def start(self):
-        # 启动 Playwright 浏览器（懒加载），多次调用会重用同一 browser context
+    def start(self, load_state: bool = True):
+        """启动 Playwright 浏览器（懒加载），多次调用会重用同一 browser context。
+
+        Args:
+            load_state: 是否从 state_file 加载已保存的浏览器状态。
+                        仅当 state_file 已设置且文件存在时有效。
+        """
         if sync_playwright is None:
             raise RuntimeError("缺少 playwright 依赖，请安装 playwright 并运行 `python -m playwright install chromium`。")
 
@@ -68,7 +86,6 @@ class WebBrowser:
             if self.page is not None and not getattr(self.page, "is_closed", lambda: False)():
                 return
         except Exception:
-            # 若检查状态失败则继续创建新 page
             pass
 
         # 启动 playwright 并创建 browser/context/page
@@ -79,10 +96,35 @@ class WebBrowser:
         else:
             headless = os.getenv("PWDEBUG") is None
         self.browser = self._playwright.chromium.launch(headless=headless)
-        self.context = self.browser.new_context()
+
+        # 根据 load_state 和 state_file 决定是否加载已保存的状态
+        storage_state_path = None
+        if load_state and self.state_file and Path(self.state_file).exists():
+            storage_state_path = self.state_file
+
+        self.context = self.browser.new_context(storage_state=storage_state_path)
         self.page = self.context.new_page()
 
+    def save_state(self, path: Optional[str] = None):
+        """保存当前浏览器状态（cookies、localStorage、sessionStorage）到文件。
+
+        如果未指定 path，则使用初始化时传入的 state_file。
+        如果 state_file 也未设置，则不执行任何操作。
+        """
+        if not self.context:
+            return
+        target = path or self.state_file
+        if not target:
+            return
+        try:
+            self.context.storage_state(path=target)
+        except Exception:
+            pass
+
     def close(self):
+        """关闭浏览器并自动保存状态。"""
+        # 在销毁 context 前保存状态
+        self.save_state()
         if self.page:
             try:
                 self.page.close()
@@ -170,33 +212,21 @@ class WebBrowser:
                     selected = "".join(s for s in sents if s)[:max_chars]
                     visible_text_summary = selected
 
-            # 收集常见交互元素（a, button, input, textarea, select），采集更多字段便于构造精确选择器
+            # 收集常见交互元素（a, button, input, textarea, select），JS 侧完成文本清洗/截断/选择器生成
             elements = self.page.eval_on_selector_all(
                 "a,button,input,textarea,select",
-                "els => els.slice(0, 80).map(el => ({ role: el.tagName.toLowerCase(), id: el.id||'', name: el.getAttribute('name')||'', type: el.getAttribute('type')||'', aria_label: el.getAttribute('aria-label')||'', classes: el.className||'', text: (el.innerText||el.value||'').trim(), outer: (el.outerHTML||'').slice(0,300) }))"
+                "els => els.slice(0, 20).map(el => ({"
+                "  role: el.tagName.toLowerCase(),"
+                "  id: el.id || '',"
+                "  name: el.getAttribute('name') || '',"
+                "  type: el.getAttribute('type') || '',"
+                "  aria_label: el.getAttribute('aria-label') || '',"
+                "  classes: el.className || '',"
+                "  text: ((el.innerText || el.value || '').trim().replace(/\\s+/g, ' ')).slice(0, 120),"
+                "  selector_sample: el.id ? '#' + el.id : el.tagName.toLowerCase(),"
+                "  outer: (el.outerHTML || '').slice(0, 300)"
+                "}))"
             )
-            # 后处理：保留最多 20 个元素，文本截断到 120 字，移除过多空白
-            processed = []
-            for el in (elements or [])[:20]:
-                text = (el.get('text') or '')
-                text = re.sub(r"\s+", " ", text).strip()
-                if len(text) > 120:
-                    text = text[:117] + '...'
-                selector_sample = el.get('role')
-                if el.get('id'):
-                    selector_sample = f"#{el.get('id')}"
-                processed.append({
-                    'role': el.get('role'),
-                    'id': el.get('id'),
-                    'name': el.get('name'),
-                    'type': el.get('type'),
-                    'aria_label': el.get('aria_label'),
-                    'classes': el.get('classes'),
-                    'text': text,
-                    'selector_sample': selector_sample,
-                    'outer_html_snippet': el.get('outer')
-                })
-            elements = processed
             observation = {
                 "url": url,
                 "title": title,
@@ -373,3 +403,68 @@ class WebBrowser:
             return ToolResult(status="ok", data=f"已保存截图：{path}", meta={"screenshot": path, "url": self.page.url}).to_dict()
         except Exception as exc:
             return ToolResult(status="error", error_code="SCREENSHOT_ERROR", error_msg=str(exc), suggestion="截图失败，请确认页面是否已加载。" ).to_dict()
+
+    def browser_clear_state(self) -> Dict[str, Any]:
+        """清除当前浏览器状态（cookies、localStorage、sessionStorage）并删除已保存的状态文件。"""
+        try:
+            self.start()
+            # 清除 cookies
+            if self.context:
+                self.context.clear_cookies()
+            # 清除 localStorage 和 sessionStorage
+            try:
+                self.page.evaluate("localStorage.clear(); sessionStorage.clear();")
+            except Exception:
+                pass
+            # 删除状态文件
+            if self.state_file and Path(self.state_file).exists():
+                Path(self.state_file).unlink()
+            return ToolResult(status="ok", data="已清除浏览器状态（cookies、localStorage、sessionStorage）及状态文件。").to_dict()
+        except Exception as exc:
+            return ToolResult(status="error", error_code="CLEAR_STATE_ERROR", error_msg=str(exc), suggestion="清除状态失败，请重试。" ).to_dict()
+
+
+def decide_state_from_task(task: str, llm_call: Callable[[str, str, int], str], state_file: Optional[str] = None) -> bool:
+    """通过 LLM 判断给定任务是否需要复用已保存的浏览器状态。
+
+    如果状态文件不存在，直接返回 False（无需加载）。
+    否则调用 LLM 做轻量判断（仅消耗 ~20 token）。
+
+    Args:
+        task: 用户任务描述。
+        llm_call: LLM 调用函数，签名 (system_prompt, user_prompt, max_tokens) -> str。
+        state_file: 状态文件路径。为 None 或文件不存在时返回 False。
+
+    Returns:
+        True 表示需要加载已保存的状态，False 表示需要全新环境。
+    """
+    if not state_file or not Path(state_file).exists():
+        return False
+
+    decision_prompt = (
+        "你是一个浏览器 Agent 的状态决策器。根据用户的任务描述，判断是否需要复用已保存的浏览器状态"
+        "（cookies、localStorage、sessionStorage）。\n\n"
+        "需要复用状态的场景（返回 true）：\n"
+        "- 查看邮件、搜索信息、浏览网页等常规操作\n"
+        "- 需要保持登录态才能完成的任务\n"
+        "- 连续操作类任务（如购物、填写表单）\n\n"
+        "不需要复用状态的场景（返回 false）：\n"
+        "- 测试登录、注册、退出登录功能\n"
+        "- 测试密码重置、验证码等认证流程\n"
+        "- 需要以全新身份访问页面的场景\n"
+        "- 测试清除 cookies 或隐私相关功能\n\n"
+        f"用户任务：{task}\n\n"
+        "请只返回一个 JSON 对象，格式为：{\"use_saved_state\": true} 或 {\"use_saved_state\": false}"
+    )
+
+    try:
+        response = llm_call(
+            system_prompt="你是一个状态决策器，只返回 JSON。",
+            user_prompt=decision_prompt,
+            max_tokens=50,
+        )
+        parsed = json.loads(response.strip())
+        return bool(parsed.get("use_saved_state", False))
+    except Exception:
+        # 解析失败时保守处理：不加载状态
+        return False

@@ -13,7 +13,7 @@
     "instructions": [
       "请根据用户任务选择最合适的浏览器工具并输出 JSON 格式的动作结果。",
       "返回结果必须是一个 JSON 对象，包含 thought、action、action_input 三个字段。",
-      "action 只能是以下工具名之一：browser_open、browser_observe、browser_click、browser_type、browser_select、browser_extract、browser_screenshot、finish。",
+      "action 只能是以下工具名之一：browser_open、browser_observe、browser_click、browser_type、browser_select、browser_extract、browser_screenshot、browser_clear_state、finish。",
       "action_input 如果有多个参数，请使用 JSON 字符串格式，例如 {\"url\": \"...\", \"selector\": \"...\"}。"
     ],
     "examples": [
@@ -77,6 +77,13 @@
     "browser_screenshot": {
       "name": "browser_screenshot",
       "description": "保存当前页面截图并返回路径。",
+      "params": {},
+      "input_param": "",
+      "requires_confirmation": false
+    },
+    "browser_clear_state": {
+      "name": "browser_clear_state",
+      "description": "清除当前浏览器的所有状态（cookies、localStorage、sessionStorage）并删除已保存的状态文件。适用于测试登录、注册、退出登录等需要全新浏览器环境的场景。",
       "params": {},
       "input_param": "",
       "requires_confirmation": false
