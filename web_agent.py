@@ -52,17 +52,13 @@ class WebAgent(BaseReActAgent):
             "browser_observe": self.browser.browser_observe,
             "browser_click": self.browser.browser_click,
             "browser_type": self.browser.browser_type,
-            "browser_select": self.browser_select,
+            "browser_select": self.browser.browser_select,
             "browser_extract": self.browser.browser_extract,
             "browser_screenshot": self.browser.browser_screenshot,
             "browser_clear_state": self.browser.browser_clear_state,
         }
         tool_metadata = config.get("tools", {})
         super().__init__(task=task, tools=tools, tool_metadata=tool_metadata, llm_call=call_openai_llm, config=config)
-
-    def browser_select(self, selector: str, value: str) -> Dict[str, Any]:
-        """封装 browser_select 工具接口，保持工具映射一致。"""
-        return self.browser.browser_select(selector=selector, value=value)
 
     def run(self) -> str:
         """执行 Agent 逻辑：先通过 LLM 决策状态复用，再执行 REACT 循环，最后保存状态。"""

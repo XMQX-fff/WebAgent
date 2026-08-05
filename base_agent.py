@@ -10,6 +10,9 @@ import re
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+# LLM 调用失败时返回的异常前缀，用于上层识别
+LLM_FAILURE_PREFIX = "LLM 调用失败"
+
 
 def load_json_config(path: Path) -> Dict[str, Any]:
     """读取 JSON 配置文件并返回字典。
@@ -49,7 +52,9 @@ class BaseReActAgent:
         agent_cfg = config.get("agent", {})
         self.max_turns = agent_cfg.get("max_turns", 8)
         self.history_window = agent_cfg.get("history_window", 10)
-        self.trace_file = agent_cfg.get("trace_file", "web_agent_trace.jsonl")
+        # 将 trace_file 解析为绝对路径，避免依赖运行目录
+        trace_file_rel = agent_cfg.get("trace_file", "web_agent_trace.jsonl")
+        self.trace_file = str(Path(trace_file_rel).resolve())
         self.system_prompt = config.get("llm", {}).get("system_prompt", "你是一个 REACT Agent。")
         self.max_tokens = config.get("llm", {}).get("max_tokens", 256)
 
@@ -160,20 +165,13 @@ class BaseReActAgent:
 
         if not action:
             lowered = cleaned.lower()
-            # 如果没有明确输出 action，则尝试从文本里匹配工具名称或 finish 指令
-            if "browser_open" in lowered:
-                action = "browser_open"
-            elif "browser_observe" in lowered:
-                action = "browser_observe"
-            elif "browser_click" in lowered:
-                action = "browser_click"
-            elif "browser_type" in lowered:
-                action = "browser_type"
-            elif "browser_extract" in lowered:
-                action = "browser_extract"
-            elif "browser_screenshot" in lowered:
-                action = "browser_screenshot"
-            elif "finish" in lowered or "完成" in lowered or "结束" in lowered:
+            # 如果没有明确输出 action，则尝试从文本里匹配已知工具名称或 finish 指令
+            # 动态从 self.tools 的键名推断，避免硬编码具体工具名
+            for tool_name in self.tools:
+                if tool_name.lower() in lowered:
+                    action = tool_name
+                    break
+            if not action and ("finish" in lowered or "完成" in lowered or "结束" in lowered):
                 action = "finish"
 
         return {"thought": thought, "action": action, "action_input": action_input}
@@ -206,6 +204,17 @@ class BaseReActAgent:
         # 当无法判断具体参数名时，用 text 回退，便于一些工具兼容单一文本输入
         return {"text": action_input}
 
+    def validate_required_params(self, tool_spec: Dict[str, Any], params: Dict[str, Any]) -> Optional[str]:
+        """校验必选参数是否齐全，返回缺失参数提示或 None。"""
+        required = [
+            name for name, spec in tool_spec.get("params", {}).items()
+            if isinstance(spec, dict) and spec.get("required", False)
+        ]
+        missing = [name for name in required if name not in params or not str(params[name]).strip()]
+        if missing:
+            return f"缺少必选参数: {missing}。请重新调用并提供这些参数。"
+        return None
+
     def perform_action(self, action: str, action_input: str) -> str:
         """执行指定工具动作，并返回 observation 文本。"""
         action = action.strip()
@@ -223,6 +232,10 @@ class BaseReActAgent:
             return f"工具不可用：{action}。"
 
         params = self.parse_action_input(tool_spec, action_input)
+        # 调用前校验必选参数，给出对 LLM 友好的提示
+        missing_hint = self.validate_required_params(tool_spec, params)
+        if missing_hint:
+            return f"ERROR[MISSING_PARAMS]: {missing_hint}"
         try:
             result = tool(**params)
         except Exception as exc:
@@ -250,13 +263,27 @@ class BaseReActAgent:
         try:
             while self.step_count < self.max_turns:
                 prompt_text = self.build_react_prompt()
-                response = self.llm_call(
-                    system_prompt=self.system_prompt,
-                    user_prompt=prompt_text,
-                    max_tokens=self.max_tokens,
-                )
+                try:
+                    response = self.llm_call(
+                        system_prompt=self.system_prompt,
+                        user_prompt=prompt_text,
+                        max_tokens=self.max_tokens,
+                    )
+                except Exception as exc:
+                    # LLM 调用失败时立即终止，避免空转浪费资源
+                    error_message = f"LLM 调用失败，终止执行：{exc}"
+                    self.error = error_message
+                    self.add_trace(
+                        thought_summary="LLM 调用失败，提前退出循环。",
+                        tool=None,
+                        args={},
+                        observation=error_message,
+                        cost_estimate="none",
+                    )
+                    return error_message
                 parsed = self.parse_llm_response(response)
-                action = parsed["action"] or "browser_observe"
+                # 默认 action 从已知工具中选取第一个（通常是观察类工具），避免硬编码
+                action = parsed["action"] or (next(iter(self.tools)) if self.tools else "finish")
                 action_input = parsed["action_input"]
                 thought = parsed["thought"] or "模型未提供 thought。"
                 self.step_count += 1

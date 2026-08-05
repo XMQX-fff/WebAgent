@@ -42,9 +42,16 @@ class ToolResult:
 
     def to_dict(self) -> Dict[str, Any]:
         # 将结果序列化为 dict，以便 Agent 统一消费
+        # error 时也保留 meta（如 browser_click 的 debug_matches 诊断信息）
         if self.status == "ok":
             return {"status": "ok", "data": self.data, "meta": self.meta}
-        return {"status": "error", "error_code": self.error_code, "error_msg": self.error_msg, "suggestion": self.suggestion}
+        return {
+            "status": "error",
+            "error_code": self.error_code,
+            "error_msg": self.error_msg,
+            "suggestion": self.suggestion,
+            "meta": self.meta,
+        }
 
 
 class WebBrowser:
@@ -77,11 +84,12 @@ class WebBrowser:
         Args:
             load_state: 是否从 state_file 加载已保存的浏览器状态。
                         仅当 state_file 已设置且文件存在时有效。
+                        注意：如果浏览器已启动，此参数不会生效（不会重新加载状态）。
         """
         if sync_playwright is None:
             raise RuntimeError("缺少 playwright 依赖，请安装 playwright 并运行 `python -m playwright install chromium`。")
 
-        # 如果已有 page 且未关闭，则复用
+        # 如果已有 page 且未关闭，则复用（load_state 参数在已启动时无效）
         try:
             if self.page is not None and not getattr(self.page, "is_closed", lambda: False)():
                 return
@@ -174,12 +182,21 @@ class WebBrowser:
         return selector
 
     def browser_open(self, url: str) -> Dict[str, Any]:
-        # 打开指定 URL 并等待页面空闲，返回 title 与最终 url
+        # 打开指定 URL 并等待页面加载，返回 title 与最终 url
         try:
             self.start()
             url = self._normalize_url(url)
             self.page.goto(url, timeout=15000)
-            self.page.wait_for_load_state("networkidle", timeout=10000)
+            # 先等待 DOM 内容加载完成（这是最基本的加载状态）
+            try:
+                self.page.wait_for_load_state("domcontentloaded", timeout=10000)
+            except PlaywrightTimeoutError:
+                pass
+            # 再尝试等待网络空闲，但容忍其失败（某些页面永远不会达到 networkidle）
+            try:
+                self.page.wait_for_load_state("networkidle", timeout=5000)
+            except PlaywrightTimeoutError:
+                pass
             title = self.page.title()
             current_url = self.page.url
             return ToolResult(status="ok", data=f"页面已打开: {title} | {current_url}", meta={"title": title, "url": current_url}).to_dict()
@@ -205,9 +222,8 @@ class WebBrowser:
                 if len(raw) <= max_chars:
                     visible_text_summary = raw
                 else:
-                    # 尝试按中文句号或英文句号分割
-                    import re as _re
-                    sents = _re.split(r'(?<=[。\.\!\?])\s*', raw[: max_chars * 2])
+                    # 尝试按中文句号或英文句号分割（re 已在文件顶部导入）
+                    sents = re.split(r'(?<=[。\.\!\?])\s*', raw[: max_chars * 2])
                     # 取前两句拼接，若不足再截断到 max_chars
                     selected = "".join(s for s in sents if s)[:max_chars]
                     visible_text_summary = selected
