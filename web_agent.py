@@ -1,8 +1,10 @@
-"""WebAgent 的主 Agent 实现。
+"""WebAgent 的主 Agent 实现与 CLI 入口。
 
-此文件提供 `WebAgent`，实现基于浏览器工具的 Web 自动化 Agent。
-通过配置文件 `config/agent_config.json` 加载工具元数据与 prompt 模板，
-使用 `openai_client` 封装的大模型调用。
+本文件提供两种架构的入口：
+  1. `WebAgent` — 单 Agent（REACT）架构，基于 `BaseReActAgent`，向后兼容。
+  2. `MultiAgentCoordinator` — Planner + Executor + Verifier 三 Agent 架构（推荐）。
+
+CLI 入口 `main()` 默认使用三 Agent 架构，可通过 `--single` 参数回退到单 Agent 架构。
 
 支持浏览器状态持久化：Agent 启动前通过 LLM 判断任务是否需要复用已保存的浏览器状态
 （cookies/localStorage），并在运行结束后自动保存状态。
@@ -18,10 +20,12 @@ try:
     from openai_client import call_openai_llm
     from web_tools import WebBrowser, decide_state_from_task
     from base_agent import BaseReActAgent, load_json_config
+    from multi_agent import MultiAgentCoordinator
 except ImportError:
     from .openai_client import call_openai_llm
     from .web_tools import WebBrowser, decide_state_from_task
     from .base_agent import BaseReActAgent, load_json_config
+    from .multi_agent import MultiAgentCoordinator
 
 
 # 默认浏览器状态文件路径
@@ -125,21 +129,36 @@ class WebAgent(BaseReActAgent):
 
 
 def main():
-    if len(sys.argv) > 1:
-        task = " ".join(sys.argv[1:]).strip()
+    # 解析命令行参数：支持 --single 回退到单 Agent 架构，其余参数拼成任务
+    use_single = False
+    args = sys.argv[1:]
+    if "--single" in args:
+        use_single = True
+        args = [a for a in args if a != "--single"]
+
+    if args:
+        task = " ".join(args).strip()
     else:
-        print("WebAgent: 使用 Playwright 操作网页。")
+        arch_label = "单 Agent (REACT)" if use_single else "三 Agent (Planner + Executor + Verifier)"
+        print(f"WebAgent: 使用 Playwright 操作网页。当前架构：{arch_label}")
         task = input("请输入你的网页任务，例如：打开 https://example.com 并提取页面标题\n> ").strip()
 
     if not task:
         print("任务不能为空。")
         sys.exit(1)
 
-    agent = WebAgent(task)
-    result = agent.run()
+    if use_single:
+        agent = WebAgent(task)
+        result = agent.run()
+        trace_file = agent.trace_file
+    else:
+        coordinator = MultiAgentCoordinator(task)
+        result = coordinator.run()
+        trace_file = coordinator.trace_file
+
     print("\n=== 结果 ===")
     print(result)
-    print(f"追踪已写入：{agent.trace_file}")
+    print(f"追踪已写入：{trace_file}")
 
 
 if __name__ == "__main__":

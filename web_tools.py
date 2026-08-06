@@ -181,27 +181,73 @@ class WebBrowser:
             return selector
         return selector
 
+    def _try_close_popups(self) -> None:
+        """尝试关闭页面上的广告/弹窗。
+
+        通过 JS 查找常见的弹窗关闭按钮（如 .close、.modal-close、[aria-label=Close] 等）
+        并触发点击。此方法为尽力而为，任何异常都会被吞掉。
+        """
+        if not self.page:
+            return
+        try:
+            # 常见弹窗关闭按钮选择器
+            close_selectors = [
+                ".modal .close",
+                ".modal-close",
+                ".popup-close",
+                ".ad-close",
+                "[aria-label='Close']",
+                "[aria-label='close']",
+                ".close",
+                "button.close",
+                ".btn-close",
+                "[data-dismiss='modal']",
+            ]
+            for sel in close_selectors:
+                try:
+                    loc = self.page.locator(sel)
+                    count = loc.count()
+                    for i in range(min(count, 3)):
+                        try:
+                            l = loc.nth(i)
+                            if l.is_visible():
+                                l.click(timeout=1000)
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
     def browser_open(self, url: str) -> Dict[str, Any]:
         # 打开指定 URL 并等待页面加载，返回 title 与最终 url
+        # 使用 domcontentloaded 而非默认的 load，避免等待所有资源（图片/广告等）导致超时
         try:
             self.start()
             url = self._normalize_url(url)
-            self.page.goto(url, timeout=15000)
-            # 先等待 DOM 内容加载完成（这是最基本的加载状态）
             try:
-                self.page.wait_for_load_state("domcontentloaded", timeout=10000)
+                self.page.goto(url, timeout=15000, wait_until="domcontentloaded")
             except PlaywrightTimeoutError:
+                # goto 超时不立即报错：页面可能已导航到目标 URL，只是仍在加载资源
+                # 下方会检查当前页面状态，若已加载则视为成功
                 pass
             # 再尝试等待网络空闲，但容忍其失败（某些页面永远不会达到 networkidle）
             try:
                 self.page.wait_for_load_state("networkidle", timeout=5000)
             except PlaywrightTimeoutError:
                 pass
-            title = self.page.title()
-            current_url = self.page.url
-            return ToolResult(status="ok", data=f"页面已打开: {title} | {current_url}", meta={"title": title, "url": current_url}).to_dict()
-        except PlaywrightTimeoutError as exc:
-            return ToolResult(status="error", error_code="TIMEOUT", error_msg=str(exc), suggestion="页面加载超时，请检查 URL 或重试。").to_dict()
+            # 检查当前页面状态：即使 goto 超时，页面可能已成功导航
+            current_url = self.page.url or ""
+            title = ""
+            try:
+                title = self.page.title() or ""
+            except Exception:
+                pass
+            if current_url and current_url != "about:blank" and title:
+                # 页面已导航到目标且有标题，视为成功（可能加载较慢但内容已可用）
+                return ToolResult(status="ok", data=f"页面已打开: {title} | {current_url}", meta={"title": title, "url": current_url}).to_dict()
+            # 页面确实未加载，返回错误并建议先观察当前状态
+            return ToolResult(status="error", error_code="TIMEOUT", error_msg=f"页面加载超时，当前 URL: {current_url}", suggestion="页面加载超时，但页面可能已部分加载。建议先使用 browser_observe 观察当前页面状态，而不是立即重试 browser_open。").to_dict()
         except Exception as exc:
             return ToolResult(status="error", error_code="OPEN_ERROR", error_msg=str(exc), suggestion="检查 URL 格式或浏览器环境。" ).to_dict()
 
@@ -209,6 +255,11 @@ class WebBrowser:
         # 观察页面并返回简要摘要：URL、title、可见文本片段和交互元素列表
         try:
             self.start()
+            # 先尝试关闭可能遮挡页面的广告/弹窗
+            try:
+                self._try_close_popups()
+            except Exception:
+                pass
             url = self.page.url or "未打开页面"
             title = self.page.title() or "无标题"
             # 获取 body 文本，用于自动摘要（严格限制长度以节省 token）
@@ -265,9 +316,28 @@ class WebBrowser:
                     loc.scroll_into_view_if_needed()
                 except Exception:
                     pass
-                loc.click(timeout=8000)
+                # 点击可能被广告遮挡或触发弹窗，使用 try/except 避免卡死
                 try:
-                    self.page.wait_for_load_state("networkidle", timeout=8000)
+                    loc.click(timeout=5000)
+                except Exception:
+                    # 点击失败时尝试强制 JS 点击
+                    try:
+                        loc.evaluate("el => el.click()")
+                    except Exception:
+                        pass
+                # 等待页面加载，但容忍广告等持续加载导致的超时
+                try:
+                    self.page.wait_for_load_state("domcontentloaded", timeout=5000)
+                except Exception:
+                    pass
+                # 尝试关闭可能弹出的广告/弹窗（常见广告关闭按钮）
+                try:
+                    self._try_close_popups()
+                except Exception:
+                    pass
+                # 短暂等待页面稳定，但不阻塞过久
+                try:
+                    self.page.wait_for_load_state("networkidle", timeout=3000)
                 except Exception:
                     pass
 

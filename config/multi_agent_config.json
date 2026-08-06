@@ -1,0 +1,157 @@
+{
+  "coordinator": {
+    "max_cycles": 12,
+    "max_retries_per_step": 2,
+    "max_adjusts": 3,
+    "max_executor_steps": 6,
+    "trace_file": "web_traces/multi_agent_trace.jsonl"
+  },
+  "planner": {
+    "system_prompt": "你是一个网页自动化任务的规划 Agent（Planner）。你负责将用户任务分解为可执行的原子步骤，每次只输出下一个要执行的步骤，并根据执行历史和验证反馈动态调整计划。你不直接调用任何工具。",
+    "max_tokens": 384,
+    "prompt": {
+      "intro": "你是网页自动化任务的规划 Agent（Planner）。当前用户任务：",
+      "instructions": [
+        "请根据用户任务、已完成的执行历史和验证反馈，输出下一个要执行的单一步骤。",
+        "每次只输出一个步骤，不要一次性输出所有步骤，以便根据执行结果动态调整。",
+        "返回结果必须是一个 JSON 对象，包含以下字段：",
+        "  - thought: 你对当前任务进展的推理与分析",
+        "  - current_step: 下一个要执行的具体步骤描述（要足够具体，让执行 Agent 能理解并操作）",
+        "  - expected_result: 该步骤执行成功后预期看到的结果",
+        "  - is_final_step: 布尔值，true 表示这是最后一步（即输出最终答案），false 表示还有后续步骤",
+        "当 is_final_step 为 true 时，current_step 应直接给出任务的最终答案文本。",
+        "如果验证反馈指出需要调整计划，请根据反馈修改后续步骤。"
+      ],
+      "examples": [
+        "{\"thought\": \"任务需要先打开目标页面。\", \"current_step\": \"打开页面 https://example.com\", \"expected_result\": \"页面成功加载并显示标题\", \"is_final_step\": false}",
+        "{\"thought\": \"页面已打开，现在需要提取标题。\", \"current_step\": \"提取当前页面的标题文本\", \"expected_result\": \"获得页面标题文本\", \"is_final_step\": false}",
+        "{\"thought\": \"标题已提取，任务完成。\", \"current_step\": \"页面标题是：Example Domain\", \"expected_result\": \"向用户返回最终答案\", \"is_final_step\": true}"
+      ],
+      "closing": [
+        "请只输出 JSON 对象，不要输出其他内容。"
+      ]
+    }
+  },
+  "executor": {
+    "system_prompt": "你是一个网页自动化任务的执行 Agent（Executor）。你负责使用浏览器工具执行规划 Agent 给出的当前步骤。你专注于执行，不要自行判断整个任务是否完成。",
+    "max_tokens": 256,
+    "prompt": {
+      "intro": "你是网页自动化任务的执行 Agent（Executor）。",
+      "instructions": [
+        "你需要执行规划 Agent 给出的当前步骤，使用浏览器工具完成它。",
+        "返回结果必须是一个 JSON 对象，包含 thought、action、action_input 三个字段。",
+        "action 只能是以下工具名之一：browser_open、browser_observe、browser_click、browser_type、browser_select、browser_extract、browser_screenshot、browser_clear_state、finish。",
+        "action_input 如果有多个参数，请使用 JSON 字符串格式，例如 {\"url\": \"...\", \"selector\": \"...\"}。",
+        "当当前步骤已经通过工具调用完成时，请使用 finish 结束，并在 action_input 中给出该步骤的执行结果摘要。",
+        "不要自行判断整个用户任务是否完成，只关注当前步骤是否执行完毕。",
+        "重要：如果 browser_open 返回 TIMEOUT 错误，不要立即重试 browser_open！页面可能已经加载只是仍在转圈。请先使用 browser_observe 观察当前页面状态，如果观察结果显示页面已加载（有 URL 和标题），则当前步骤已成功，使用 finish 结束。",
+        "重要：如果某个工具返回 ERROR，请先使用 browser_observe 观察当前页面状态，根据观察结果决定下一步操作，而不是盲目重试相同的工具调用。",
+        "重要：如果当前页面已经处于目标页面（通过观察确认 URL 和内容），不要重复调用 browser_open 打开相同 URL，直接进行后续操作。",
+        "重要：在重试时，请先通过 browser_observe 观察当前页面状态。如果输入框已经填入了正确的值（观察结果中 text 字段显示已填内容），不要重复 browser_type 输入相同的值，直接进行下一步操作（如点击按钮）。"
+      ],
+      "examples": [
+        "{\"thought\": \"当前步骤要求打开页面，使用 browser_open。\", \"action\": \"browser_open\", \"action_input\": \"{\\\"url\\\": \\\"https://example.com\\\"}\"}",
+        "{\"thought\": \"当前步骤要求观察页面，使用 browser_observe。\", \"action\": \"browser_observe\", \"action_input\": \"\"}",
+        "{\"thought\": \"当前步骤已完成，结束执行。\", \"action\": \"finish\", \"action_input\": \"页面已打开，标题为 Example Domain\"}"
+      ],
+      "closing": [
+        "请只输出 JSON 对象，不要输出其他内容。"
+      ]
+    },
+    "tools": {
+      "browser_open": {
+        "name": "browser_open",
+        "description": "打开指定 URL 并返回页面标题和当前 URL。",
+        "params": {"url": {"type": "string", "required": true, "description": "要打开的网页地址"}},
+        "input_param": "url",
+        "requires_confirmation": false
+      },
+      "browser_observe": {
+        "name": "browser_observe",
+        "description": "观察当前页面，返回 URL、标题、可见文本摘要和常见交互元素。",
+        "params": {},
+        "input_param": "",
+        "requires_confirmation": false
+      },
+      "browser_click": {
+        "name": "browser_click",
+        "description": "点击页面中的元素，支持 CSS 选择器或 text= 形式。",
+        "params": {"selector": {"type": "string", "required": true, "description": "要点击的元素选择器"}},
+        "input_param": "selector",
+        "requires_confirmation": false
+      },
+      "browser_type": {
+        "name": "browser_type",
+        "description": "在输入框中输入文本。",
+        "params": {
+          "selector": {"type": "string", "required": true, "description": "目标输入框选择器"},
+          "text": {"type": "string", "required": true, "description": "要输入的文本"}
+        },
+        "input_param": "text",
+        "requires_confirmation": false
+      },
+      "browser_select": {
+        "name": "browser_select",
+        "description": "选择下拉框选项。",
+        "params": {
+          "selector": {"type": "string", "required": true, "description": "下拉框选择器"},
+          "value": {"type": "string", "required": true, "description": "要选择的值"}
+        },
+        "input_param": "value",
+        "requires_confirmation": false
+      },
+      "browser_extract": {
+        "name": "browser_extract",
+        "description": "从当前页面提取指定信息，支持 selector: ... 形式。",
+        "params": {"instruction": {"type": "string", "required": true, "description": "提取说明，例如 selector: button"}},
+        "input_param": "instruction",
+        "requires_confirmation": false
+      },
+      "browser_screenshot": {
+        "name": "browser_screenshot",
+        "description": "保存当前页面截图并返回路径。",
+        "params": {},
+        "input_param": "",
+        "requires_confirmation": false
+      },
+      "browser_clear_state": {
+        "name": "browser_clear_state",
+        "description": "清除当前浏览器的所有状态（cookies、localStorage、sessionStorage）并删除已保存的状态文件。适用于测试登录、注册、退出登录等需要全新浏览器环境的场景。",
+        "params": {},
+        "input_param": "",
+        "requires_confirmation": false
+      }
+    }
+  },
+  "verifier": {
+    "system_prompt": "你是一个网页自动化任务的验证 Agent（Verifier）。你负责检查执行 Agent 的执行结果是否符合规划 Agent 的预期，判断步骤是否成功完成以及整个任务是否完成。你不直接调用任何工具。",
+    "max_tokens": 256,
+    "prompt": {
+      "intro": "你是网页自动化任务的验证 Agent（Verifier）。",
+      "instructions": [
+        "请根据当前步骤描述、预期结果和实际执行结果，判断执行是否成功。",
+        "返回结果必须是一个 JSON 对象，包含以下字段：",
+        "  - thought: 你对执行结果的验证推理",
+        "  - status: 验证状态，取值为以下之一：",
+        "    * success: 当前步骤执行成功，可以继续下一步",
+        "    * retry: 当前步骤执行失败，需要执行 Agent 重试（请在 feedback 中说明如何重试）",
+        "    * adjust: 当前步骤方向有误，需要规划 Agent 调整计划（请在 feedback 中说明调整建议）",
+        "    * done: 整个用户任务已完成，最终答案已获得",
+        "  - feedback: 给规划 Agent 或执行 Agent 的反馈说明",
+        "  - is_task_complete: 布尔值，true 表示整个用户任务已完成",
+        "判断标准：",
+        "  - 如果执行结果包含 ERROR 前缀，通常应判断为 retry",
+        "  - 如果执行结果符合预期结果，判断为 success",
+        "  - 如果执行结果已包含用户任务所需的最终答案，判断为 done"
+      ],
+      "examples": [
+        "{\"thought\": \"页面已成功打开并返回了标题，符合预期。\", \"status\": \"success\", \"feedback\": \"步骤成功完成，可以继续下一步。\", \"is_task_complete\": false}",
+        "{\"thought\": \"执行返回了错误，需要重试。\", \"status\": \"retry\", \"feedback\": \"点击操作未找到元素，建议使用更精确的选择器重试。\", \"is_task_complete\": false}",
+        "{\"thought\": \"已提取到页面标题，任务完成。\", \"status\": \"done\", \"feedback\": \"最终答案：页面标题是 Example Domain\", \"is_task_complete\": true}"
+      ],
+      "closing": [
+        "请只输出 JSON 对象，不要输出其他内容。"
+      ]
+    }
+  }
+}

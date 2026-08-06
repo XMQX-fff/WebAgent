@@ -2,29 +2,115 @@
 
 基于 Playwright 浏览器工具和 OpenAI 格式大模型的网页自动化 Agent。
 
-采用 **REACT（Reasoning + Acting）** 交互模式：Agent 通过"观察-思考-行动"循环，调用浏览器工具完成用户指定的网页任务，并将每一步 trace 记录下来。
+支持两种架构：
+- **三 Agent 架构（推荐）**：Planner + Executor + Verifier，职责分离，带独立验证与动态调整能力。
+- **单 Agent 架构（兼容）**：REACT（Reasoning + Acting）模式，"观察-思考-行动"循环。
 
 ## 目录结构
 
 ```
 WebAgent/
-├── __init__.py             # 包导出入口
-├── base_agent.py           # BaseReActAgent 基类与配置加载工具
-├── web_agent.py            # WebAgent 主程序与 CLI 入口
-├── web_tools.py            # Playwright 浏览器工具封装
-├── openai_client.py        # OpenAI 风格大模型调用接口
+├── __init__.py                  # 包导出入口
+├── base_agent.py                # BaseReActAgent 基类与配置加载工具
+├── web_agent.py                 # WebAgent（单Agent）与 CLI 入口
+├── web_tools.py                 # Playwright 浏览器工具封装
+├── openai_client.py             # OpenAI 风格大模型调用接口
+├── planner_agent.py             # Planner Agent（规划）
+├── executor_agent.py            # Executor Agent（执行）
+├── verifier_agent.py            # Verifier Agent（验证）
+├── multi_agent.py               # MultiAgentCoordinator 协调器与 CLI 入口
 ├── config/
-│   └── agent_config.json   # Agent prompt 模板与工具元数据配置
+│   ├── agent_config.json        # 单 Agent prompt 模板与工具元数据配置
+│   └── multi_agent_config.json  # 三 Agent 配置（planner/executor/verifier）
 ├── web_traces/
-│   └── web_agent_trace.jsonl  # 运行 trace 记录
-├── requirements.txt        # 依赖列表
-└── README.md               # 本文件
+│   ├── web_agent_trace.jsonl    # 单 Agent 运行 trace 记录
+│   └── multi_agent_trace.jsonl  # 三 Agent 运行 trace 记录
+├── docs/
+│   ├── LEARNING_AGENT.md        # 项目深度解析与学习指南
+│   └── ISSUES_AND_SOLUTIONS.md  # 问题记录与解决方案
+├── requirements.txt             # 依赖列表
+└── README.md                    # 本文件
 ```
 
 ## 架构说明
 
+### 三 Agent 架构（Planner + Executor + Verifier，推荐）
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                       MultiAgentCoordinator                        │
+│                      (三Agent协调器 + 主循环)                       │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  ┌─────────────────────┐    ┌─────────────────────┐                │
+│  │    Planner Agent     │    │   Executor Agent    │                │
+│  │                      │    │                     │                │
+│  │ 职责:                │    │ 职责:               │                │
+│  │ - 分解任务为步骤序列  │───▶│ - 执行当前步骤      │                │
+│  │ - 制定执行计划        │    │ - 调用浏览器工具    │                │
+│  │ - 响应验证反馈        │    │ - 处理执行异常      │                │
+│  │ - 调整/细化计划       │    │ - 记录执行细节      │                │
+│  └──────────┬───────────┘    └──────────┬──────────┘                │
+│             ▲                           │                          │
+│             │                           ▼                          │
+│             │              ┌─────────────────────┐                │
+│             │              │   Verifier Agent     │                │
+│             │              │                     │                │
+│             └──────────────│ 职责:               │                │
+│                            │ - 校验执行结果      │                │
+│                            │ - 判断步骤是否完成  │                │
+│                            │ - 验证最终答案质量  │                │
+│                            │ - 决定下一步：      │                │
+│                            │   • success → 下一步 │                │
+│                            │   • retry → 重试    │                │
+│                            │   • adjust → 调整   │                │
+│                            │   • done → 返回     │                │
+│                            └─────────────────────┘                │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+- **`planner_agent.py`** — `PlannerAgent`，将用户任务分解为可执行的原子步骤，每次只输出下一个步骤，并根据验证反馈动态调整计划。不直接调用工具。
+- **`executor_agent.py`** — `ExecutorAgent`，继承 `BaseReActAgent`，针对单个步骤运行工具循环，专注执行，不判断整个任务是否完成。
+- **`verifier_agent.py`** — `VerifierAgent`，校验执行结果是否符合预期，输出 `success`/`retry`/`adjust`/`done` 四种状态，驱动协调器决策。
+- **`multi_agent.py`** — `MultiAgentCoordinator`，编排三 Agent 主循环，管理浏览器生命周期与统一 trace 记录。
+
+#### 三 Agent 协作流程
+
+```
+MultiAgentCoordinator.run():
+  │
+  ├── 0. 浏览器状态决策与启动（LLM 判断是否复用登录态）
+  │
+  ├── 1. Planner 分析任务，输出下一个步骤指令（current_step + expected_result）
+  │     ↓
+  ├── 2. Executor 执行该步骤，调用浏览器工具（最多 max_executor_steps 轮）
+  │     ↓
+  ├── 3. Verifier 校验执行结果
+  │     ↓
+  ├── 4. 根据 Verifier 决定:
+  │     ├── success → 记录历史，回到步骤 1（规划下一个步骤）
+  │     ├── retry   → 回到步骤 2（重试当前步骤，最多 max_retries_per_step 次）
+  │     ├── adjust  → 带反馈回到步骤 1（Planner 调整计划，最多 max_adjusts 次）
+  │     └── done    → 输出最终结果
+  │
+  └── 5. 统一 trace 记录三 Agent 协作全过程（写入 multi_agent_trace.jsonl）
+```
+
+#### 配置说明
+
+三 Agent 架构的配置位于 `config/multi_agent_config.json`，分为四个部分：
+
+| 配置块 | 说明 | 关键参数 |
+|--------|------|----------|
+| `coordinator` | 协调器运行参数 | `max_cycles`（最大循环数）、`max_retries_per_step`（单步最大重试）、`max_adjusts`（最大调整次数）、`max_executor_steps`（单步最大工具调用轮数） |
+| `planner` | Planner 的 system_prompt、max_tokens、prompt 模板 | prompt 包含 intro/instructions/examples/closing |
+| `executor` | Executor 的 system_prompt、max_tokens、prompt 模板、工具元数据 | tools 部分与单 Agent 的 `agent_config.json` 一致 |
+| `verifier` | Verifier 的 system_prompt、max_tokens、prompt 模板 | 输出四种状态：success/retry/adjust/done |
+
+### 单 Agent 架构（REACT，兼容）
+
 - **`base_agent.py`** — 通用 REACT Agent 基类 `BaseReActAgent`，实现 prompt 构建、LLM 响应解析、工具调用调度、trace 记录等核心循环逻辑，独立于具体工具实现。
-- **`web_agent.py`** — `WebAgent` 继承 `BaseReActAgent`，绑定浏览器工具集（通过 `web_tools.WebBrowser`）和 OpenAI LLM 调用，提供 CLI 命令行入口。
+- **`web_agent.py`** — `WebAgent` 继承 `BaseReActAgent`，绑定浏览器工具集（通过 `web_tools.WebBrowser`）和 OpenAI LLM 调用。
 - **`openai_client.py`** — 封装 OpenAI 格式的 chat completion 调用，支持通过环境变量配置 API Key 和 Base URL。
 
 这种分层设计使得 `BaseReActAgent` 可以被复用于其他非浏览器的自动化场景——只需继承并传入不同的工具映射和 LLM 调用函数即可。
@@ -52,24 +138,39 @@ export OPENAI_BASE_URL="https://api.example.com/v1"
 
 ### 3. 运行 Agent
 
-交互模式：
+默认使用**三 Agent 架构**（Planner + Executor + Verifier）：
 
 ```bash
+# 交互模式
 python web_agent.py
+
+# 直接传入任务
+python web_agent.py "打开 https://example.com 并提取页面标题"
 ```
 
-直接传入任务：
+如需回退到**单 Agent 架构**（REACT），添加 `--single` 参数：
 
 ```bash
-python web_agent.py "打开 https://example.com 并提取页面标题"
+python web_agent.py --single "打开 https://example.com 并提取页面标题"
+```
+
+也可以直接运行三 Agent 入口：
+
+```bash
+python multi_agent.py "打开 https://example.com 并提取页面标题"
 ```
 
 ### 4. 作为 Python 包导入
 
 ```python
-from WebAgent import WebAgent, BaseReActAgent
+from WebAgent import WebAgent, MultiAgentCoordinator, BaseReActAgent
 
-# 使用 WebAgent
+# 使用三 Agent 架构（推荐）
+coordinator = MultiAgentCoordinator("打开 https://example.com 并提取页面标题")
+result = coordinator.run()
+print(result)
+
+# 使用单 Agent 架构（兼容）
 agent = WebAgent("打开 https://example.com 并提取页面标题")
 result = agent.run()
 print(result)
@@ -90,11 +191,37 @@ class MyAgent(BaseReActAgent):
 | `browser_select` | 选择下拉框选项 |
 | `browser_extract` | 从页面中提取指定信息 |
 | `browser_screenshot` | 保存当前页面截图 |
-| `finish` | 结束任务并输出最终结果 |
+| `browser_clear_state` | 清除浏览器状态（cookies/localStorage/sessionStorage）并删除状态文件 |
+| `finish` | 结束当前步骤/任务并输出结果 |
 
 ## 交互示例
 
+### 三 Agent 架构（默认）
+
 ```
+WebAgent: 使用 Playwright 操作网页。当前架构：三 Agent (Planner + Executor + Verifier)
+请输入你的网页任务，例如：打开 https://example.com 并提取页面标题
+> 打开 https://www.example.com 并告诉我页面标题是什么
+
+=== 结果 ===
+页面标题是：Example Domain
+追踪已写入：web_traces/multi_agent_trace.jsonl
+```
+
+三 Agent 架构的 trace 记录按阶段标注，示例：
+
+```jsonl
+{"cycle": 0, "phase": "init", "thought_summary": "LLM 决策：不使用已保存的浏览器状态，以全新环境启动", "observation": "已跳过状态加载，以全新浏览器环境启动。"}
+{"cycle": 0, "phase": "init", "thought_summary": "自动打开初始 URL", "tool": "browser_open", "args": {"url": "https://www.example.com"}, "observation": "页面已打开: Example Domain | https://www.example.com/"}
+{"cycle": 1, "phase": "planner", "thought": "页面已打开，需要提取标题。", "current_step": "提取当前页面的标题文本", "expected_result": "获得页面标题文本", "is_final_step": false}
+{"cycle": 1, "phase": "executor", "current_step": "提取当前页面的标题文本", "execution_result": "Example Domain", "retry_count": 0}
+{"cycle": 1, "phase": "verifier", "current_step": "提取当前页面的标题文本", "execution_result": "Example Domain", "status": "done", "feedback": "最终答案：页面标题是 Example Domain", "is_task_complete": true}
+```
+
+### 单 Agent 架构（`--single`）
+
+```
+WebAgent: 使用 Playwright 操作网页。当前架构：单 Agent (REACT)
 请输入你的网页任务，例如：打开 https://example.com 并提取页面标题
 > 打开 https://www.example.com 并告诉我页面标题是什么
 
@@ -106,10 +233,19 @@ class MyAgent(BaseReActAgent):
 ## 运行结果
 
 - 最终答案打印到终端。
-- 每一步的 thought / action / observation 会追加写入 `web_traces/web_agent_trace.jsonl`。
+- **三 Agent 架构**：协调器按 `init`/`planner`/`executor`/`verifier`/`coordinator` 阶段记录 trace，追加写入 `web_traces/multi_agent_trace.jsonl`。
+- **单 Agent 架构**：每一步的 thought / action / observation 追加写入 `web_traces/web_agent_trace.jsonl`。
 - 截图文件保存在 `web_traces/` 目录。
+- 浏览器状态（cookies/localStorage）在任务结束时自动保存到 `web_traces/browser_state.json`，下次运行时由 LLM 决定是否复用。
 
 ## 注意
 
 - 目前只支持公开网页自动化，不支持登录凭据、验证码、支付等敏感操作。
 - 需要有效的 OpenAI 兼容 API Key。
+- 三 Agent 架构相比单 Agent 会消耗更多 LLM 调用（每个步骤至少 3 次：规划 + 执行 + 验证），但具备独立验证与动态调整能力，适合复杂任务。
+- 可通过 `config/multi_agent_config.json` 中的 `coordinator` 配置块调整循环与重试上限，控制 token 消耗。
+
+## 相关文档
+
+- [docs/LEARNING_AGENT.md](docs/LEARNING_AGENT.md) — 项目深度解析与学习指南
+- [docs/ISSUES_AND_SOLUTIONS.md](docs/ISSUES_AND_SOLUTIONS.md) — 问题记录与解决方案
