@@ -7,14 +7,19 @@
 ## 目录
 
 1. [项目概览](#1-项目概览)
-2. [核心概念：REACT 模式](#2-核心概念react-模式)
+2. [核心概念：REACT 模式与多 Agent 架构](#2-核心概念react-模式与多-agent-架构)
 3. [架构分层](#3-架构分层)
 4. [模块详解](#4-模块详解)
    - [4.1 base_agent.py — REACT 循环核心](#41-base_agentpy--react-循环核心)
    - [4.2 web_tools.py — 浏览器工具层](#42-web_toolspy--浏览器工具层)
-   - [4.3 web_agent.py — 业务组装层](#43-web_agentpy--业务组装层)
+   - [4.3 web_agent.py — 单 Agent 业务组装层](#43-web_agentpy--单-agent-业务组装层)
    - [4.4 openai_client.py — LLM 调用层](#44-openai_clientpy--llm-调用层)
-   - [4.5 config/agent_config.json — 配置驱动](#45-configagent_configjson--配置驱动)
+   - [4.5 config/agent_config.json — 单 Agent 配置驱动](#45-configagent_configjson--单-agent-配置驱动)
+   - [4.6 planner_agent.py — 规划 Agent](#46-planner_agentpy--规划-agent)
+   - [4.7 executor_agent.py — 执行 Agent](#47-executor_agentpy--执行-agent)
+   - [4.8 verifier_agent.py — 验证 Agent](#48-verifier_agentpy--验证-agent)
+   - [4.9 multi_agent.py — 三 Agent 协调器](#49-multi_agentpy--三-agent-协调器)
+   - [4.10 config/multi_agent_config.json — 多 Agent 配置](#410-configmulti_agent_configjson--多-agent-配置)
 5. [数据流与执行流程](#5-数据流与执行流程)
 6. [关键设计模式](#6-关键设计模式)
 7. [Trace 追踪系统](#7-trace-追踪系统)
@@ -26,9 +31,16 @@
 
 ## 1. 项目概览
 
-**WebAgent** 是一个基于 **REACT（Reasoning + Acting）** 交互模式的网页自动化 Agent。它让大语言模型（LLM）通过"观察 → 思考 → 行动"的循环，调用 Playwright 浏览器工具完成用户指定的网页任务。
+**WebAgent** 是一个基于 Playwright 浏览器工具和 OpenAI 兼容大模型的网页自动化 Agent。它支持两种架构：
+
+- **三 Agent 架构（推荐）**：Planner + Executor + Verifier，职责分离，带独立验证与动态调整能力。
+- **单 Agent 架构（兼容）**：REACT（Reasoning + Acting）模式，"观察-思考-行动"循环。
 
 ```
+# 三 Agent 架构
+用户任务 ──→ Planner 规划 ──→ Executor 执行 ──→ Verifier 验证 ──→ 完成/调整/重试
+
+# 单 Agent 架构
 用户任务 ──→ LLM 思考 ──→ 调用浏览器工具 ──→ 观察结果 ──→ 再次思考 ──→ ... ──→ 完成任务
 ```
 
@@ -43,19 +55,23 @@
 
 ### 核心特性
 
-- **REACT 循环**：LLM 与浏览器工具交替执行，形成"思考-行动"闭环
+- **多 Agent 协作**：Planner 规划、Executor 执行、Verifier 验证，职责分离
+- **REACT 循环**：单 Agent 模式下 LLM 与浏览器工具交替执行，形成"思考-行动"闭环
 - **配置驱动**：prompt 模板、工具元数据、运行参数全部由 JSON 配置管理
 - **分层解耦**：通用 Agent 基类与具体浏览器工具完全分离，可复用于非浏览器场景
 - **Trace 追踪**：每一步的 thought/action/observation 记录到 JSONL 文件
 - **状态持久化**：支持跨任务复用浏览器登录态（cookies/localStorage）
+- **容错降级**：超时自动观察、广告弹窗清理、JS 点击兜底等健壮性设计
 
 ---
 
-## 2. 核心概念：REACT 模式
+## 2. 核心概念：REACT 模式与多 Agent 架构
+
+### 2.1 REACT 模式（单 Agent 架构）
 
 REACT 是 **Reasoning + Acting** 的缩写，由 Shunyu Yao 等人提出（论文：[ReAct: Synergizing Reasoning and Acting in Language Models](https://arxiv.org/abs/2210.03629)）。
 
-### 核心思想
+#### 核心思想
 
 传统 LLM 要么只"思考"（Chain-of-Thought），要么只"行动"（Act-only）。REACT 将两者结合：
 
@@ -63,7 +79,7 @@ REACT 是 **Reasoning + Acting** 的缩写，由 Shunyu Yao 等人提出（论�
 Thought（思考）→ Action（行动）→ Observation（观察）→ Thought → ...
 ```
 
-### 在本项目中的体现
+#### 在本项目中的体现
 
 每个循环步骤中，LLM 输出一个 JSON 对象：
 
@@ -81,17 +97,72 @@ Thought（思考）→ Action（行动）→ Observation（观察）→ Thought 
 | `action` | 要调用的工具名（如 `browser_open`、`browser_click`） |
 | `action_input` | 传给工具的参数（JSON 字符串或纯文本） |
 
-### 为什么有效？
+#### 为什么有效？
 
 1. **思考引导行动**：模型先推理再行动，减少盲目操作
 2. **观察反馈思考**：工具返回的观察结果（页面内容、错误信息）作为下一轮思考的输入
 3. **可解释性**：每一步都有 thought 记录，方便调试和审计
 
+### 2.2 多 Agent 架构（Planner + Executor + Verifier）
+
+#### 为什么需要多 Agent？
+
+单 Agent 架构虽然简单，但存在明显短板：
+
+| 短板 | 说明 |
+|------|------|
+| **职责混搭** | 规划、执行、验证全部由同一个 LLM 承担，上下文压力大 |
+| **无独立验证** | Agent 自行判断"任务完成"，可能过早结束或陷入死循环 |
+| **无法自纠错** | 执行出错时没有独立的"第三方"对结果进行校验和反馈 |
+| **上下文浪费** | 每次循环都要将完整历史拼入 prompt |
+
+多 Agent 架构将职责拆分给三个独立的 LLM 角色：
+
+```
+┌─────────────────────────────────────────────────────┐
+│               MultiAgentCoordinator                 │
+│             （三 Agent 协调器 + 主循环）             │
+├─────────────────────────────────────────────────────┤
+│                                                     │
+│   Planner Agent          Executor Agent             │
+│   （规划）               （执行）                    │
+│   - 分解任务              - 使用工具执行             │
+│   - 输出单步指令          - 专注当前步骤             │
+│   - 响应验证反馈          - 处理执行异常             │
+│   - 调整计划              - 记录执行细节             │
+│        ▲                       │                    │
+│        │                       ▼                    │
+│        │           Verifier Agent                   │
+│        │           （验证）                          │
+│        └────反馈──── - 校验执行结果                  │
+│                       - 判断步骤/任务完成            │
+│                       - 输出 success/retry/         │
+│                         adjust/done                 │
+└─────────────────────────────────────────────────────┘
+```
+
+#### 三个角色的输入/输出
+
+| Agent | 输入 | 输出 | 职责 |
+|-------|------|------|------|
+| **Planner** | 用户任务 + 执行历史 + 验证反馈 | 当前步骤指令（current_step + expected_result + is_final_step） | 分解任务、制定计划、调整方向 |
+| **Executor** | 当前步骤指令 + 浏览器状态上下文 | 步骤执行结果 | 调用浏览器工具完成步骤 |
+| **Verifier** | 当前步骤 + 预期结果 + 实际结果 | 验证状态 + 反馈 | 判断成功/重试/调整/完成 |
+
+#### 为什么有效？
+
+1. **职责分离**：每个 LLM 只关注一件事，prompt 更聚焦
+2. **独立验证**：Verifier 作为"第三方"校验执行结果，防止 Agent 自欺欺人
+3. **动态调整**：Verifier 的反馈驱动 Planner 调整计划，形成闭环
+4. **可追踪**：每个阶段都有独立 trace 记录，便于分析失败原因
+
 ---
 
 ## 3. 架构分层
 
-项目采用清晰的分层架构，各层职责单一、通过接口解耦：
+### 3.1 单 Agent 架构分层
+
+单 Agent 架构采用清晰的分层架构，各层职责单一、通过接口解耦：
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -115,7 +186,7 @@ Thought（思考）→ Action（行动）→ Observation（观察）→ Thought 
 └──────────────────┘        └────────────────────────┘
 ```
 
-### 分层职责
+#### 分层职责
 
 | 层 | 文件 | 职责 | 依赖 |
 |----|------|------|------|
@@ -130,6 +201,55 @@ Thought（思考）→ Action（行动）→ Observation（观察）→ Thought 
 - `llm_call: Callable` — 统一的 LLM 调用函数签名
 
 这意味着你可以用同样的基类构建**文件系统 Agent**、**数据库 Agent** 等，只需替换工具映射和 LLM 调用。
+
+### 3.2 三 Agent 架构分层
+
+三 Agent 架构在单 Agent 基础上增加了**协调层**和**三个独立 Agent 角色**：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    用户 / CLI 入口                           │
+│              web_agent.py (main) / multi_agent.py           │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────────┐
+│              协调层 MultiAgentCoordinator                   │
+│        - 编排三 Agent 主循环 / 浏览器生命周期 / trace        │
+└───────┬──────────────────────────────┬─────────────────────┘
+        │                              │
+┌───────▼──────────┐        ┌──────────▼─────────────────────┐
+│  Planner Agent   │        │  Executor Agent                │
+│  planner_agent.py│        │  executor_agent.py             │
+│  - 任务分解       │        │  - 继承 BaseReActAgent         │
+│  - 单步规划       │        │  - 单步骤工具循环              │
+│  - 响应反馈       │        │  - 浏览器状态上下文注入        │
+└───────┬──────────┘        └──────────┬─────────────────────┘
+        │                              │
+        │         ┌────────────────────▼─────────────────────┐
+        └─────────│  Verifier Agent                          │
+                  │  verifier_agent.py                       │
+                  │  - 校验执行结果                           │
+                  │  - 输出 success/retry/adjust/done        │
+                  └──────────────────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────────┐
+│              共享基础设施层                                  │
+│  - web_tools.py（浏览器工具）                                │
+│  - openai_client.py（LLM 调用）                              │
+│  - base_agent.py（REACT 基类，Executor 复用）                │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 分层职责
+
+| 层 | 文件 | 职责 |
+|----|------|------|
+| 入口层 | `web_agent.py` / `multi_agent.py` | CLI 交互、任务接收、架构选择 |
+| 协调层 | `multi_agent.py` | 编排三 Agent 主循环、浏览器生命周期、统一 trace |
+| 规划层 | `planner_agent.py` | 任务分解、单步规划、响应验证反馈 |
+| 执行层 | `executor_agent.py` | 继承 `BaseReActAgent`，执行单步骤工具循环 |
+| 验证层 | `verifier_agent.py` | 校验执行结果、输出验证状态 |
+| 共享基础设施 | `web_tools.py` / `openai_client.py` / `base_agent.py` | 浏览器工具、LLM 调用、REACT 基类 |
 
 ---
 
@@ -226,9 +346,9 @@ JSON 对象 → 冒号分隔的键值对 → 单一 input_param → 单一参数
 
 | 工具 | 功能 | 关键实现 |
 |------|------|----------|
-| `browser_open` | 打开 URL | 自动补全 `https://` 前缀，等待 networkidle |
-| `browser_observe` | 观察页面 | 提取 URL/标题/可见文本摘要/交互元素列表 |
-| `browser_click` | 点击元素 | 多策略定位：id → role+name → CSS → JS 兜底 |
+| `browser_open` | 打开 URL | 自动补全 `https://` 前缀，使用 `domcontentloaded` 避免等待所有资源 |
+| `browser_observe` | 观察页面 | 提取 URL/标题/可见文本摘要/交互元素列表，观察前自动关闭弹窗 |
+| `browser_click` | 点击元素 | 多策略定位：id → role+name → CSS → JS 兜底，点击后自动关闭弹窗 |
 | `browser_type` | 输入文本 | `page.fill()` 直接填充 |
 | `browser_select` | 选择下拉框 | `page.select_option()` |
 | `browser_extract` | 提取内容 | 支持 `selector: xxx` 指令语法 |
@@ -390,9 +510,225 @@ def call_openai_llm(system_prompt, user_prompt, max_tokens=256):
 
 ---
 
+### 4.6 planner_agent.py — 规划 Agent
+
+`PlannerAgent` 是三 Agent 架构中的**大脑**，负责将用户任务分解为可执行的原子步骤。
+
+#### 类结构
+
+```python
+class PlannerAgent:
+    def __init__(self, task, llm_call, config):
+        self.task = task              # 用户任务
+        self.llm_call = llm_call      # LLM 调用函数
+        self.history = []             # 执行历史（供规划参考）
+```
+
+#### 核心方法
+
+| 方法 | 作用 |
+|------|------|
+| `add_history()` | 追加一条执行历史记录（步骤、结果、验证状态） |
+| `build_prompt()` | 构建 prompt：任务 + 执行历史 + 验证反馈 |
+| `parse_response()` | 解析 LLM 输出，提取 thought/current_step/expected_result/is_final_step |
+| `plan_next_step()` | 调用 LLM 生成下一个步骤指令 |
+
+#### 输出格式
+
+Planner 每次输出一个 JSON 对象：
+
+```json
+{
+  "thought": "页面已打开，需要提取标题。",
+  "current_step": "提取当前页面的标题文本",
+  "expected_result": "获得页面标题文本",
+  "is_final_step": false
+}
+```
+
+| 字段 | 含义 |
+|------|------|
+| `thought` | 对当前任务进展的推理与分析 |
+| `current_step` | 下一个要执行的具体步骤描述 |
+| `expected_result` | 该步骤执行成功后预期看到的结果 |
+| `is_final_step` | 是否为最后一步（true 时 current_step 直接给出最终答案） |
+
+**设计要点**：Planner 每次只输出**一个**步骤，而不是一次性输出所有步骤，这样可以根据执行结果和验证反馈动态调整计划。
+
+---
+
+### 4.7 executor_agent.py — 执行 Agent
+
+`ExecutorAgent` 继承 `BaseReActAgent`，复用其工具调用与解析能力，但运行的是**单步骤循环**。
+
+#### 与 BaseReActAgent 的区别
+
+| 特性 | BaseReActAgent | ExecutorAgent |
+|------|---------------|---------------|
+| 任务范围 | 整个用户任务 | 单个步骤指令 |
+| 循环上限 | `max_turns` | `max_steps`（单步骤内工具轮数） |
+| 浏览器上下文 | 无 | 由协调器注入 `browser_context` |
+| 超时安全网 | 无 | `browser_open` 超时自动观察 |
+
+#### 核心方法
+
+| 方法 | 作用 |
+|------|------|
+| `build_react_prompt()` | 重写：以 current_step 为核心，展示浏览器当前状态 |
+| `run()` | 重写：单步骤工具循环，含超时安全网 |
+| `reset_for_new_step()` | 为执行新步骤重置内部状态 |
+
+#### 关键设计：浏览器状态上下文注入
+
+```python
+# 协调器在每步开始前注入浏览器当前状态
+self.browser_context: Optional[str] = None
+
+# prompt 中展示
+f"浏览器当前页面: {browser_ctx_text}"
+```
+
+**作用**：避免 Executor 在每个新步骤开始时不知道页面已打开，盲目重新 `browser_open`。
+
+#### 关键设计：超时安全网
+
+```python
+# browser_open 超时后自动观察页面状态
+if action == "browser_open" and observation.startswith("ERROR[TIMEOUT]"):
+    auto_obs = self.perform_action("browser_observe", "")
+    if not auto_obs.startswith("ERROR["):
+        return f"页面已打开（browser_open 超时但页面已加载）。观察结果：{auto_obs[:500]}"
+```
+
+**作用**：即使 LLM 判断失误，也不会浪费工具调用轮数反复重试打开页面。
+
+---
+
+### 4.8 verifier_agent.py — 验证 Agent
+
+`VerifierAgent` 是三 Agent 架构中的**裁判**，负责校验 Executor 的执行结果。
+
+#### 验证状态
+
+| 状态 | 含义 | 协调器动作 |
+|------|------|-----------|
+| `success` | 当前步骤执行成功 | 记录历史，进入下一个规划周期 |
+| `retry` | 当前步骤执行失败 | 让 Executor 重试当前步骤 |
+| `adjust` | 当前步骤方向有误 | 带反馈让 Planner 调整计划 |
+| `done` | 整个任务已完成 | 输出最终结果 |
+
+#### 核心方法
+
+| 方法 | 作用 |
+|------|------|
+| `build_prompt()` | 构建 prompt：步骤 + 预期结果 + 实际结果 |
+| `parse_response()` | 解析 LLM 输出，提取 thought/status/feedback/is_task_complete |
+| `verify()` | 调用 LLM 验证执行结果，含启发式降级 |
+
+#### 启发式降级
+
+```python
+# 如果执行结果明显是错误，但 LLM 判断为 success/done，降级为 retry
+if execution_result.startswith("ERROR[") and result["status"] not in (STATUS_RETRY, STATUS_ADJUST):
+    result["status"] = STATUS_RETRY
+```
+
+**作用**：即使 LLM 误判，代码层也能兜底，防止错误结果被当作成功。
+
+---
+
+### 4.9 multi_agent.py — 三 Agent 协调器
+
+`MultiAgentCoordinator` 是三 Agent 架构的**指挥中心**，负责编排整个主循环。
+
+#### 核心方法
+
+| 方法 | 作用 |
+|------|------|
+| `add_trace()` | 记录协调器级别的 trace（按 phase 标注） |
+| `_get_browser_context()` | 获取浏览器当前页面状态摘要 |
+| `_ensure_executor()` | 创建/复用 Executor 并注入浏览器状态 |
+| `run()` | 三 Agent 主循环 |
+
+#### 主循环流程
+
+```
+MultiAgentCoordinator.run():
+  │
+  ├── 0. 浏览器状态决策与启动（LLM 判断是否复用登录态）
+  │
+  ├── 1. Planner 分析任务，输出下一个步骤指令
+  │     ↓
+  ├── 2. Executor 执行该步骤，调用浏览器工具
+  │     ↓
+  ├── 3. Verifier 校验执行结果
+  │     ↓
+  ├── 4. 根据 Verifier 决定:
+  │     ├── success → 记录历史，回到步骤 1
+  │     ├── retry   → 回到步骤 2（重试，最多 max_retries_per_step 次）
+  │     ├── adjust  → 带反馈回到步骤 1（最多 max_adjusts 次）
+  │     └── done    → 输出最终结果
+  │
+  └── 5. 统一 trace 记录三 Agent 协作全过程
+```
+
+#### 安全限制
+
+| 参数 | 默认值 | 作用 |
+|------|--------|------|
+| `max_cycles` | 12 | 最大规划周期数 |
+| `max_retries_per_step` | 2 | 单步最大重试次数 |
+| `max_adjusts` | 3 | 最大计划调整次数 |
+| `max_executor_steps` | 6 | 单步内 Executor 最大工具调用轮数 |
+
+---
+
+### 4.10 config/multi_agent_config.json — 多 Agent 配置
+
+三 Agent 架构的配置分为四个部分：
+
+```json
+{
+  "coordinator": {
+    "max_cycles": 12,
+    "max_retries_per_step": 2,
+    "max_adjusts": 3,
+    "max_executor_steps": 6,
+    "trace_file": "web_traces/multi_agent_trace.jsonl"
+  },
+  "planner": {
+    "system_prompt": "你是一个网页自动化任务的规划 Agent（Planner）...",
+    "max_tokens": 384,
+    "prompt": { "intro": "...", "instructions": [...], "examples": [...], "closing": [...] }
+  },
+  "executor": {
+    "system_prompt": "你是一个网页自动化任务的执行 Agent（Executor）...",
+    "max_tokens": 256,
+    "prompt": { "intro": "...", "instructions": [...], "examples": [...], "closing": [...] },
+    "tools": { "browser_open": {...}, ... }
+  },
+  "verifier": {
+    "system_prompt": "你是一个网页自动化任务的验证 Agent（Verifier）...",
+    "max_tokens": 256,
+    "prompt": { "intro": "...", "instructions": [...], "examples": [...], "closing": [...] }
+  }
+}
+```
+
+#### 配置块说明
+
+| 配置块 | 说明 | 关键参数 |
+|--------|------|----------|
+| `coordinator` | 协调器运行参数 | 循环/重试/调整/工具轮数上限 |
+| `planner` | Planner 的 system_prompt、max_tokens、prompt 模板 | prompt 包含 intro/instructions/examples/closing |
+| `executor` | Executor 的 system_prompt、max_tokens、prompt 模板、工具元数据 | tools 部分与单 Agent 的 `agent_config.json` 一致 |
+| `verifier` | Verifier 的 system_prompt、max_tokens、prompt 模板 | 输出四种状态：success/retry/adjust/done |
+
+---
+
 ## 5. 数据流与执行流程
 
-### 完整执行时序
+### 5.1 单 Agent 架构执行时序
 
 ```
 用户输入任务
@@ -433,13 +769,79 @@ def call_openai_llm(system_prompt, user_prompt, max_tokens=256):
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 一次典型任务的完整 trace 示例
+#### 单 Agent 典型 trace 示例
 
 ```
 Step 1 | Thought: 先打开目标页面。 | Tool: browser_open | Args: {"url": "https://example.com"} | Observation: 页面已打开: Example Domain | https://example.com
 Step 2 | Thought: 观察页面结构。 | Tool: browser_observe | Args: {} | Observation: {"url": "...", "title": "Example Domain", "visible_text_summary": "...", "interactive_elements": [...]}
 Step 3 | Thought: 页面标题已获取，任务完成。 | Tool: finish | Args: {"action_input": "页面标题是：Example Domain"} | Observation: 页面标题是：Example Domain
 ```
+
+### 5.2 三 Agent 架构执行时序
+
+```
+用户输入任务
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│ MultiAgentCoordinator.__init__                              │
+│  - 加载 config/multi_agent_config.json                      │
+│  - 创建 WebBrowser 实例                                     │
+│  - 创建 PlannerAgent / VerifierAgent                        │
+│  - Executor 延迟创建（需要 current_step）                   │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│ MultiAgentCoordinator.run()                                 │
+│  0. decide_state_from_task() → 浏览器状态决策与启动          │
+│  1. 自动打开初始 URL（如有）                                 │
+│  2. 进入三 Agent 主循环（最多 max_cycles 轮）                │
+│  3. finally: browser.close()（自动保存状态）                 │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 三 Agent 主循环（每个 cycle）                                │
+│                                                             │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │ ① Planner.plan_next_step()                          │  │
+│  │    → 输出 current_step + expected_result             │  │
+│  └──────────────────────┬───────────────────────────────┘  │
+│                         ▼                                  │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │ ② Executor.run()（单步骤工具循环）                   │  │
+│  │    → 注入 browser_context                            │  │
+│  │    → 调用浏览器工具执行步骤                          │  │
+│  └──────────────────────┬───────────────────────────────┘  │
+│                         ▼                                  │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │ ③ Verifier.verify()                                 │  │
+│  │    → 校验执行结果                                    │  │
+│  │    → 输出 status + feedback                          │  │
+│  └──────────────────────┬───────────────────────────────┘  │
+│                         ▼                                  │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │ ④ 根据 status 决策：                                 │  │
+│  │    success → 记录历史，进入下一个 cycle               │  │
+│  │    retry   → 回到 ②（最多 max_retries_per_step 次）  │  │
+│  │    adjust  → 带反馈回到 ①（最多 max_adjusts 次）     │  │
+│  │    done    → 输出最终结果                             │  │
+│  └──────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 三 Agent 典型 trace 示例
+
+```jsonl
+{"cycle": 0, "phase": "init", "thought_summary": "LLM 决策：不使用已保存的浏览器状态，以全新环境启动", "observation": "已跳过状态加载，以全新浏览器环境启动。"}
+{"cycle": 0, "phase": "init", "thought_summary": "自动打开初始 URL", "tool": "browser_open", "args": {"url": "https://www.example.com"}, "observation": "页面已打开: Example Domain | https://www.example.com/"}
+{"cycle": 1, "phase": "planner", "thought": "页面已打开，需要提取标题。", "current_step": "提取当前页面的标题文本", "expected_result": "获得页面标题文本", "is_final_step": false}
+{"cycle": 1, "phase": "executor", "current_step": "提取当前页面的标题文本", "execution_result": "Example Domain", "retry_count": 0}
+{"cycle": 1, "phase": "verifier", "current_step": "提取当前页面的标题文本", "execution_result": "Example Domain", "status": "done", "feedback": "最终答案：页面标题是 Example Domain", "is_task_complete": true}
+```
+
+**对比**：三 Agent 架构的 trace 按 `init`/`planner`/`executor`/`verifier`/`coordinator` 阶段标注，比单 Agent 的单一 trace 格式更清晰，便于分析每个阶段的决策过程。
 
 ---
 
@@ -460,6 +862,8 @@ result = tool(**params)         # 统一调用
 
 `BaseReActAgent.run()` 定义了算法骨架（构建 prompt → 调 LLM → 执行 → 记录），子类 `WebAgent.run()` 通过**重写**在前后插入自定义逻辑（状态决策、自动打开 URL、保存状态）。
 
+`ExecutorAgent` 也重写了 `run()`，将其从"全局任务循环"改为"单步骤循环"。
+
 ### 6.3 统一返回结构（ToolResult）
 
 所有工具返回统一字典结构，上层无需关心具体工具的实现差异：
@@ -478,12 +882,41 @@ prompt 模板、工具元数据、运行参数全部外置到 JSON，实现"改�
 - LLM 输出解析失败 → 回退到行解析 → 再回退到模糊匹配
 - 工具调用异常 → 返回错误码 + 修复建议，而非崩溃
 - 点击失败 → 多策略重试 + JS 兜底
+- `browser_open` 超时 → 自动观察页面状态，避免盲目重试
+- 广告弹窗 → `_try_close_popups()` 自动清理
+
+### 6.6 多 Agent 协作模式（三 Agent 架构）
+
+三 Agent 架构采用**流水线协作**模式：Planner → Executor → Verifier 形成闭环。
+
+```
+Planner（规划）→ Executor（执行）→ Verifier（验证）→ 反馈给 Planner → ...
+```
+
+**关键设计**：
+- **单向数据流**：Planner 只输出步骤指令，Executor 只执行，Verifier 只验证
+- **反馈闭环**：Verifier 的反馈驱动 Planner 调整计划
+- **状态注入**：协调器向 Executor 注入浏览器状态上下文，避免重复操作
+- **安全网机制**：代码层兜底（超时自动观察、启发式降级），防止 LLM 误判
+
+### 6.7 安全网模式（代码级兜底）
+
+在 LLM 决策之外增加**代码级兜底**，防止 LLM 误判导致任务卡死：
+
+| 安全网 | 触发条件 | 兜底行为 |
+|--------|---------|---------|
+| `browser_open` 超时自动观察 | `browser_open` 返回 TIMEOUT | 自动执行 `browser_observe`，页面已加载则判定成功 |
+| Verifier 启发式降级 | 执行结果含 `ERROR[` 但 LLM 判 success | 强制降级为 retry |
+| 广告弹窗清理 | 点击/观察后 | 自动查找并关闭常见弹窗 |
+| JS 点击兜底 | 普通点击失败 | 用 `el.click()` 强制触发 |
 
 ---
 
 ## 7. Trace 追踪系统
 
-### 记录内容
+### 7.1 单 Agent 架构 Trace
+
+#### 记录内容
 
 每一步记录 6 个字段：
 
@@ -498,7 +931,7 @@ prompt 模板、工具元数据、运行参数全部外置到 JSON，实现"改�
 }
 ```
 
-### 写入方式
+#### 写入方式
 
 ```python
 def add_trace(self, thought_summary, tool, args, observation, cost_estimate):
@@ -508,17 +941,52 @@ def add_trace(self, thought_summary, tool, args, observation, cost_estimate):
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")  # 追加写入 JSONL
 ```
 
-### 双重用途
+#### 双重用途
 
 1. **运行时上下文**：最近 `history_window` 步的 trace 会拼入下一轮 prompt，让 LLM 记住自己做过什么
 2. **事后审计**：JSONL 文件可离线分析 Agent 的决策过程、失败原因、token 消耗
 
-### 运行前清理
+#### 运行前清理
 
 ```python
 if Path(self.trace_file).exists():
     Path(self.trace_file).unlink()  # 每次运行前清空旧 trace
 ```
+
+### 7.2 三 Agent 架构 Trace
+
+三 Agent 架构的 trace 由协调器统一记录，按 `phase` 字段区分阶段：
+
+```json
+{
+  "cycle": 1,
+  "phase": "planner",
+  "thought": "页面已打开，需要提取标题。",
+  "current_step": "提取当前页面的标题文本",
+  "expected_result": "获得页面标题文本",
+  "is_final_step": false
+}
+```
+
+#### 阶段类型
+
+| phase | 记录内容 |
+|-------|---------|
+| `init` | 浏览器状态决策、初始 URL 打开 |
+| `planner` | Planner 的规划输出（thought/current_step/expected_result） |
+| `executor` | Executor 的执行结果（execution_result/retry_count） |
+| `verifier` | Verifier 的验证结果（status/feedback/is_task_complete） |
+| `coordinator` | 协调器级别的异常/终止信息 |
+
+#### 与单 Agent Trace 的对比
+
+| 特性 | 单 Agent | 三 Agent |
+|------|---------|---------|
+| 记录者 | `BaseReActAgent.add_trace()` | `MultiAgentCoordinator.add_trace()` |
+| 文件 | `web_agent_trace.jsonl` | `multi_agent_trace.jsonl` |
+| 字段 | step/thought/tool/args/observation | cycle/phase + 各阶段专属字段 |
+| 粒度 | 工具调用级 | 阶段级（规划/执行/验证） |
+| 分析价值 | 单 Agent 决策过程 | 多 Agent 协作过程、失败定位 |
 
 ---
 
@@ -631,11 +1099,12 @@ print(agent.run())
 
 ## 10. 学习路线建议
 
-### 阶段一：理解 REACT 模式（1-2 天）
+### 阶段一：理解 REACT 模式与多 Agent 架构（1-2 天）
 
 - 阅读 [ReAct 论文](https://arxiv.org/abs/2210.03629)
-- 运行项目，观察 trace 文件，理解"思考-行动-观察"循环
-- 尝试修改 `config/agent_config.json` 中的 prompt，观察行为变化
+- 运行项目（默认三 Agent 架构），观察 `multi_agent_trace.jsonl`，理解"规划-执行-验证"循环
+- 用 `--single` 参数运行单 Agent 架构，对比两种架构的 trace 差异
+- 尝试修改 `config/multi_agent_config.json` 中的 prompt，观察行为变化
 
 ### 阶段二：掌握核心循环（2-3 天）
 
@@ -646,20 +1115,28 @@ print(agent.run())
 ### 阶段三：深入工具层（2-3 天）
 
 - 精读 `web_tools.py`，理解 Playwright 的核心 API
-- 重点学习 `browser_click` 的多策略定位和 `browser_observe` 的 token 优化
+- 重点学习 `browser_click` 的多策略定位、`browser_observe` 的 token 优化、`_try_close_popups` 弹窗清理
 - 尝试新增一个工具（如 `browser_back`、`browser_hover`）
 
-### 阶段四：扩展与实战（3-5 天）
+### 阶段四：掌握三 Agent 架构（3-5 天）
+
+- 精读 `planner_agent.py` / `executor_agent.py` / `verifier_agent.py`，理解三个角色的职责边界
+- 精读 `multi_agent.py`，理解协调器的主循环与安全限制
+- 重点学习：浏览器状态上下文注入、超时安全网、Verifier 启发式降级
+- 尝试调整 `max_cycles` / `max_retries_per_step` / `max_adjusts` / `max_executor_steps`，观察对任务成功率的影响
+
+### 阶段五：扩展与实战（3-5 天）
 
 - 用 `BaseReActAgent` 实现一个非浏览器 Agent（文件系统、数据库、API 调用）
-- 为项目添加新能力：多轮对话记忆、任务规划、错误自动重试
+- 为三 Agent 架构添加新能力：多轮对话记忆、任务规划缓存、错误自动重试
 - 尝试接入不同的 LLM（OpenAI、DeepSeek、本地模型）
 
-### 阶段五：工程化（可选）
+### 阶段六：工程化（可选）
 
 - 为项目添加单元测试（重点测试 `parse_llm_response` 的边界情况）
 - 添加日志系统、性能监控
 - 将 trace 可视化，构建 Agent 行为分析工具
+- 阅读 `docs/ISSUES_AND_SOLUTIONS.md`，理解实际开发中遇到的坑与解决方案
 
 ---
 
