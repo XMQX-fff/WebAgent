@@ -286,25 +286,29 @@ class BaseReActAgent:
 
 ```python
 while self.step_count < self.max_turns:
-    # 1. 构建 prompt（包含任务、工具列表、历史）
+    # 1. 构建 prompt（包含任务、工具列表、历史、最近观察）
     prompt_text = self.build_react_prompt()
 
-    # 2. 调用 LLM
+    # 2. 调用 LLM → 输出 thought + action + action_input
     response = self.llm_call(system_prompt, prompt_text, max_tokens)
-
-    # 3. 解析 LLM 输出
     parsed = self.parse_llm_response(response)
 
-    # 4. 执行工具
+    # 3. 执行工具 → 自动返回 observation
     observation = self.perform_action(action, action_input)
 
-    # 5. 记录 trace
+    # 4. 记录 trace
     self.add_trace(thought, action, args, observation, cost_estimate)
 
-    # 6. 判断是否结束
+    # 5. 判断是否结束
     if action == "finish":
         return self.output
 ```
+
+> **注意**：在 REACT 循环中，**observation（观察）不是 LLM 主动执行的一步**，而是**工具执行后自动返回的结果**。无论 LLM 调用什么工具（如 `browser_open`、`browser_click`），工具都会返回一个 observation 字符串。下一轮循环的 prompt 会包含这个 observation 作为历史上下文。
+>
+> `browser_observe` 之所以存在，是因为它是**一个工具**——当 LLM 需要获取页面详细结构（URL、标题、可见文本、交互元素列表）时，可以主动调用它来获得"深度观察"。但即使不调用它，普通工具执行后也会自动返回 observation。
+>
+> 循环本质：**思考（thought）→ 行动（action + action_input）→ 自动获得观察（observation）→ 再思考 → ...**
 
 #### 响应解析的容错设计
 
