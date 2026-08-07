@@ -11,14 +11,18 @@
 ```
 WebAgent/
 ├── __init__.py                  # 包导出入口
-├── base_agent.py                # BaseReActAgent 基类与配置加载工具
-├── web_agent.py                 # WebAgent（单Agent）与 CLI 入口
-├── web_tools.py                 # Playwright 浏览器工具封装
-├── openai_client.py             # OpenAI 风格大模型调用接口
-├── planner_agent.py             # Planner Agent（规划）
-├── executor_agent.py            # Executor Agent（执行）
-├── verifier_agent.py            # Verifier Agent（验证）
-├── multi_agent.py               # MultiAgentCoordinator 协调器与 CLI 入口
+├── agents/                      # Agent 相关代码
+│   ├── __init__.py
+│   ├── base_agent.py            # BaseReActAgent 基类与配置加载工具
+│   ├── web_agent.py             # WebAgent（单Agent）与 CLI 入口
+│   ├── planner_agent.py         # Planner Agent（规划）
+│   ├── executor_agent.py        # Executor Agent（执行）
+│   ├── verifier_agent.py        # Verifier Agent（验证）
+│   └── multi_agent.py           # MultiAgentCoordinator 协调器与 CLI 入口
+├── core/                        # 核心基础设施
+│   ├── __init__.py
+│   ├── openai_client.py         # OpenAI 风格大模型调用接口
+│   └── web_tools.py             # Playwright 浏览器工具封装
 ├── config/
 │   ├── agent_config.json        # 单 Agent prompt 模板与工具元数据配置
 │   └── multi_agent_config.json  # 三 Agent 配置（planner/executor/verifier）
@@ -69,10 +73,10 @@ WebAgent/
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-- **`planner_agent.py`** — `PlannerAgent`，将用户任务分解为可执行的原子步骤，每次只输出下一个步骤，并根据验证反馈动态调整计划。不直接调用工具。
-- **`executor_agent.py`** — `ExecutorAgent`，继承 `BaseReActAgent`，针对单个步骤运行工具循环，专注执行，不判断整个任务是否完成。
-- **`verifier_agent.py`** — `VerifierAgent`，校验执行结果是否符合预期，输出 `success`/`retry`/`adjust`/`done` 四种状态，驱动协调器决策。
-- **`multi_agent.py`** — `MultiAgentCoordinator`，编排三 Agent 主循环，管理浏览器生命周期与统一 trace 记录。
+- **`agents/planner_agent.py`** — `PlannerAgent`，将用户任务分解为可执行的原子步骤，每次只输出下一个步骤，并根据验证反馈动态调整计划。不直接调用工具。
+- **`agents/executor_agent.py`** — `ExecutorAgent`，继承 `BaseReActAgent`，针对单个步骤运行工具循环，专注执行，不判断整个任务是否完成。
+- **`agents/verifier_agent.py`** — `VerifierAgent`，校验执行结果是否符合预期，输出 `success`/`retry`/`adjust`/`done` 四种状态，驱动协调器决策。
+- **`agents/multi_agent.py`** — `MultiAgentCoordinator`，编排三 Agent 主循环，管理浏览器生命周期与统一 trace 记录。
 
 #### 三 Agent 协作流程
 
@@ -109,9 +113,9 @@ MultiAgentCoordinator.run():
 
 ### 单 Agent 架构（REACT，兼容）
 
-- **`base_agent.py`** — 通用 REACT Agent 基类 `BaseReActAgent`，实现 prompt 构建、LLM 响应解析、工具调用调度、trace 记录等核心循环逻辑，独立于具体工具实现。
-- **`web_agent.py`** — `WebAgent` 继承 `BaseReActAgent`，绑定浏览器工具集（通过 `web_tools.WebBrowser`）和 OpenAI LLM 调用。
-- **`openai_client.py`** — 封装 OpenAI 格式的 chat completion 调用，支持通过环境变量配置 API Key 和 Base URL。
+- **`agents/base_agent.py`** — 通用 REACT Agent 基类 `BaseReActAgent`，实现 prompt 构建、LLM 响应解析、工具调用调度、trace 记录等核心循环逻辑，独立于具体工具实现。
+- **`agents/web_agent.py`** — `WebAgent` 继承 `BaseReActAgent`，绑定浏览器工具集（通过 `core/web_tools.WebBrowser`）和 OpenAI LLM 调用。
+- **`core/openai_client.py`** — 封装 OpenAI 格式的 chat completion 调用，支持通过环境变量配置 API Key 和 Base URL。
 
 这种分层设计使得 `BaseReActAgent` 可以被复用于其他非浏览器的自动化场景——只需继承并传入不同的工具映射和 LLM 调用函数即可。
 

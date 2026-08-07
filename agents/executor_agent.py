@@ -7,13 +7,18 @@ Executor 负责使用浏览器工具执行 Planner 给出的当前步骤。
 Executor 不负责判断整个用户任务是否完成，只关注当前步骤是否执行完毕。
 """
 
+import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 try:
-    from base_agent import BaseReActAgent
+    from agents.base_agent import BaseReActAgent
 except ImportError:
-    from .base_agent import BaseReActAgent
+    # 直接运行脚本时（python agents/executor_agent.py），将项目根目录加入 sys.path
+    _root = str(Path(__file__).resolve().parent.parent)
+    if _root not in sys.path:
+        sys.path.insert(0, _root)
+    from agents.base_agent import BaseReActAgent
 
 
 class ExecutorAgent(BaseReActAgent):

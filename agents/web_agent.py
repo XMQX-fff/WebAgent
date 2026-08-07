@@ -17,15 +17,19 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 try:
-    from openai_client import call_openai_llm
-    from web_tools import WebBrowser, decide_state_from_task
-    from base_agent import BaseReActAgent, load_json_config
-    from multi_agent import MultiAgentCoordinator
+    from core.openai_client import call_openai_llm
+    from core.web_tools import WebBrowser, decide_state_from_task
+    from agents.base_agent import BaseReActAgent, load_json_config
+    from agents.multi_agent import MultiAgentCoordinator
 except ImportError:
-    from .openai_client import call_openai_llm
-    from .web_tools import WebBrowser, decide_state_from_task
-    from .base_agent import BaseReActAgent, load_json_config
-    from .multi_agent import MultiAgentCoordinator
+    # 直接运行脚本时（python agents/web_agent.py），将项目根目录加入 sys.path
+    _root = str(Path(__file__).resolve().parent.parent)
+    if _root not in sys.path:
+        sys.path.insert(0, _root)
+    from core.openai_client import call_openai_llm
+    from core.web_tools import WebBrowser, decide_state_from_task
+    from agents.base_agent import BaseReActAgent, load_json_config
+    from agents.multi_agent import MultiAgentCoordinator
 
 
 # 默认浏览器状态文件路径
@@ -45,7 +49,7 @@ class WebAgent(BaseReActAgent):
 
     def __init__(self, task: str, state_file: Optional[str] = DEFAULT_STATE_FILE):
         # 加载 Agent 配置文件并初始化浏览器工具映射
-        config_path = Path(__file__).resolve().parent / "config" / "agent_config.json"
+        config_path = Path(__file__).resolve().parent.parent / "config" / "agent_config.json"
         config = load_json_config(config_path)
         self.browser = WebBrowser(state_file=state_file)
         # 如果任务中包含 URL，记下来以便启动时自动打开（减少 LLM 未主动打开页面的情况）

@@ -6,14 +6,14 @@
 以及浏览器工具类与 LLM 调用函数，便于在其他脚本中直接导入使用。
 """
 
-from .web_agent import WebAgent, main
-from .openai_client import call_openai_llm
-from .web_tools import WebBrowser, ToolResult
-from .base_agent import BaseReActAgent, load_json_config
-from .multi_agent import MultiAgentCoordinator
-from .planner_agent import PlannerAgent
-from .executor_agent import ExecutorAgent
-from .verifier_agent import VerifierAgent
+from .agents.web_agent import WebAgent, main
+from .core.openai_client import call_openai_llm
+from .core.web_tools import WebBrowser, ToolResult
+from .agents.base_agent import BaseReActAgent, load_json_config
+from .agents.multi_agent import MultiAgentCoordinator
+from .agents.planner_agent import PlannerAgent
+from .agents.executor_agent import ExecutorAgent
+from .agents.verifier_agent import VerifierAgent
 
 __all__ = [
     "WebAgent",

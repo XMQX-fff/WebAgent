@@ -23,19 +23,23 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
-    from openai_client import call_openai_llm
-    from web_tools import WebBrowser, decide_state_from_task
-    from base_agent import load_json_config
-    from planner_agent import PlannerAgent
-    from executor_agent import ExecutorAgent
-    from verifier_agent import VerifierAgent, STATUS_SUCCESS, STATUS_RETRY, STATUS_ADJUST, STATUS_DONE
+    from core.openai_client import call_openai_llm
+    from core.web_tools import WebBrowser, decide_state_from_task
+    from agents.base_agent import load_json_config
+    from agents.planner_agent import PlannerAgent
+    from agents.executor_agent import ExecutorAgent
+    from agents.verifier_agent import VerifierAgent, STATUS_SUCCESS, STATUS_RETRY, STATUS_ADJUST, STATUS_DONE
 except ImportError:
-    from .openai_client import call_openai_llm
-    from .web_tools import WebBrowser, decide_state_from_task
-    from .base_agent import load_json_config
-    from .planner_agent import PlannerAgent
-    from .executor_agent import ExecutorAgent
-    from .verifier_agent import VerifierAgent, STATUS_SUCCESS, STATUS_RETRY, STATUS_ADJUST, STATUS_DONE
+    # 直接运行脚本时（python agents/multi_agent.py），将项目根目录加入 sys.path
+    _root = str(Path(__file__).resolve().parent.parent)
+    if _root not in sys.path:
+        sys.path.insert(0, _root)
+    from core.openai_client import call_openai_llm
+    from core.web_tools import WebBrowser, decide_state_from_task
+    from agents.base_agent import load_json_config
+    from agents.planner_agent import PlannerAgent
+    from agents.executor_agent import ExecutorAgent
+    from agents.verifier_agent import VerifierAgent, STATUS_SUCCESS, STATUS_RETRY, STATUS_ADJUST, STATUS_DONE
 
 
 # 默认浏览器状态文件路径
@@ -55,7 +59,7 @@ class MultiAgentCoordinator:
         self.task = task
         # 加载多 Agent 配置
         if config_path is None:
-            config_path = str(Path(__file__).resolve().parent / "config" / "multi_agent_config.json")
+            config_path = str(Path(__file__).resolve().parent.parent / "config" / "multi_agent_config.json")
         config = load_json_config(Path(config_path))
 
         self.config = config
