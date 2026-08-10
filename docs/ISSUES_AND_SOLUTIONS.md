@@ -10,6 +10,8 @@
 2. [问题二：Executor 跨步骤丢失浏览器状态上下文](#问题二executor-跨步骤丢失浏览器状态上下文)
 3. [问题三：复合步骤工具轮数不足导致任务中断](#问题三复合步骤工具轮数不足导致任务中断)
 4. [问题四：点击后弹出广告导致 browser_click 卡死](#问题四点击后弹出广告导致-browser_click-卡死)
+5. [问题五：评测系统浏览器状态污染导致用例间干扰](#问题五评测系统浏览器状态污染导致用例间干扰)
+6. [问题六：LLM 评估输出格式不稳定导致评分失败](#问题六llm-评估输出格式不稳定导致评分失败)
 
 ---
 
@@ -417,6 +419,164 @@ def browser_observe(self) -> Dict[str, Any]:
 
 ---
 
+## 问题五：评测系统浏览器状态污染导致用例间干扰
+
+### 问题现象
+
+在评测系统（`evaluation/evaluator_agent.py`）连续运行多个用例时，发现**前一个用例的登录态会污染后一个用例**。例如：
+
+- 用例 1（成功登录）运行后，浏览器状态文件 `web_traces/browser_state.json` 保存了登录 cookies
+- 用例 2（登录失败-错误密码）运行时，Agent 可能复用已保存的登录态，导致"登录失败"场景无法复现
+- 用例 3（锁定用户登录）运行时，Agent 可能已经处于登录状态，无法测试锁定用户的登录流程
+
+核心痛点：**评测用例之间必须相互独立，否则无法准确评估 Agent 在每个场景下的真实表现**。
+
+### 根因分析
+
+1. **浏览器状态自动保存**：`MultiAgentCoordinator.run()` 和 `WebAgent.run()` 在 `finally` 中调用 `browser.close()`，会自动将 cookies/localStorage 保存到 `browser_state.json`。
+
+2. **状态自动复用**：下次运行时，`decide_state_from_task()` 通过 LLM 判断是否复用已保存的状态。对于"登录"类任务，LLM 可能误判为需要复用状态，导致用例间干扰。
+
+3. **评测系统未清理状态**：评测 Agent 在运行每个用例前没有主动清除浏览器状态文件。
+
+### 解决方案
+
+#### 1. `evaluation/evaluator_agent.py` - 每个用例运行前清除浏览器状态
+
+在 `EvaluatorAgent.run()` 中，每个用例运行前调用 `_clear_browser_state()`：
+
+```python
+def _clear_browser_state(self) -> None:
+    """清除浏览器状态文件，避免登录态干扰。"""
+    state_path = Path(self.state_file)
+    if state_path.exists():
+        try:
+            state_path.unlink()
+            print(f"  [清理] 已删除浏览器状态文件: {self.state_file}")
+        except OSError as exc:
+            print(f"  [警告] 删除状态文件失败: {exc}")
+```
+
+在 `run()` 主循环中调用：
+
+```python
+for idx, case in enumerate(self.cases, 1):
+    # 运行前清除浏览器状态（避免登录态干扰）
+    if case.get("requires_clear_state", True):
+        self._clear_browser_state()
+    ...
+```
+
+#### 2. 用例定义中增加 `requires_clear_state` 字段
+
+每个用例可以控制是否需要在运行前清除状态：
+
+```python
+{
+    "id": 1,
+    "name": "成功登录",
+    "requires_clear_state": True,  # 登录类用例需要清除状态
+    ...
+}
+```
+
+### 修复效果
+
+修复后，每个用例都在全新浏览器环境中运行，登录态不会跨用例污染，评测结果更加准确。
+
+---
+
+## 问题六：LLM 评估输出格式不稳定导致评分失败
+
+### 问题现象
+
+评测系统使用 LLM 对 Agent 输出进行评分时，LLM 返回的评估结果**格式不稳定**，导致 JSON 解析失败：
+
+```python
+# LLM 可能返回以下任意格式：
+# 1. 纯 JSON
+{"score": 90, "passed": true, "summary": "登录成功", "issues": []}
+
+# 2. Markdown 代码块包裹
+```json
+{"score": 90, "passed": true, "summary": "登录成功", "issues": []}
+```
+
+# 3. 带额外文本
+评估结果如下：
+{"score": 90, "passed": true, "summary": "登录成功", "issues": []}
+```
+
+核心痛点：**LLM 输出格式不稳定导致 `json.loads()` 失败，评测系统无法获得评分结果**。
+
+### 根因分析
+
+1. **LLM 输出格式不稳定**：不同模型、不同温度下，LLM 可能输出纯 JSON、Markdown 代码块、带前后缀文本等不同格式。
+
+2. **评测系统直接 `json.loads()`**：没有对 LLM 输出做预处理，遇到非纯 JSON 格式时直接抛异常。
+
+3. **异常处理过于简单**：解析失败时直接返回 `score=0, passed=False`，无法区分"Agent 真的失败"和"LLM 评估失败"。
+
+### 解决方案
+
+#### 1. `evaluation/evaluator_agent.py` - 增强 LLM 输出解析
+
+在 `_evaluate_with_llm()` 中增加 Markdown 代码块剥离和 JSON 提取：
+
+```python
+def _evaluate_with_llm(self, case: Dict[str, Any], agent_output: str) -> Dict[str, Any]:
+    try:
+        response = call_openai_llm(system_prompt, user_prompt, max_tokens=300)
+        # 解析 JSON（可能包含 markdown 代码块）
+        cleaned = response.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.split("```")[1]
+            if cleaned.startswith("json"):
+                cleaned = cleaned[4:]
+            cleaned = cleaned.strip()
+        parsed = json.loads(cleaned)
+        return {
+            "score": int(parsed.get("score", 0)),
+            "passed": bool(parsed.get("passed", False)),
+            "summary": parsed.get("summary", ""),
+            "issues": parsed.get("issues", []),
+        }
+    except Exception as exc:
+        return {
+            "score": 0,
+            "passed": False,
+            "summary": f"LLM 评估失败: {exc}",
+            "issues": ["LLM 评估失败"],
+        }
+```
+
+**关键改动**：
+- 剥离 Markdown 代码块（```json ... ```）
+- 剥离 `json` 语言标识
+- 解析失败时明确标记"LLM 评估失败"，而非误判为 Agent 失败
+
+#### 2. 在 system_prompt 中明确要求 JSON 格式
+
+```python
+system_prompt = (
+    "你是一个网页 Agent 评测专家。根据评测用例的预期结果和评测点，"
+    "评估 Agent 的实际输出是否达到预期。"
+    "请只返回一个 JSON 对象，格式为："
+    '{"score": 0-100, "passed": true/false, "summary": "简要评估总结", "issues": ["问题1", "问题2"]}'
+)
+```
+
+**作用**：从 prompt 层面引导 LLM 输出纯 JSON 格式。
+
+### 修复效果
+
+修复后：
+- LLM 返回 Markdown 代码块包裹的 JSON 也能正确解析
+- 解析失败时能明确区分"LLM 评估失败"和"Agent 执行失败"
+- 评测报告的评估摘要更准确
+
+---
+
 ## 涉及文件汇总
 
 | 文件 | 修改内容 |
@@ -425,3 +585,4 @@ def browser_observe(self) -> Dict[str, Any]:
 | `config/multi_agent_config.json` | ① Executor prompt 新增超时/错误处理指引；② `max_executor_steps` 从 4 增加到 6；③ 新增"不重复输入已填值"指引 |
 | `executor_agent.py` | ① 新增 `browser_open` 超时安全网（自动观察页面）；② 新增 `browser_context` 字段并在 prompt 中展示 |
 | `multi_agent.py` | 新增 `_get_browser_context()` 方法，在每步执行前向 Executor 注入浏览器当前状态 |
+| `evaluation/evaluator_agent.py` | ① 每个用例运行前清除浏览器状态；② 增强 LLM 评估输出解析（Markdown 代码块剥离） |

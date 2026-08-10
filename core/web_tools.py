@@ -89,20 +89,79 @@ class WebBrowser:
         if sync_playwright is None:
             raise RuntimeError("缺少 playwright 依赖，请安装 playwright 并运行 `python -m playwright install chromium`。")
 
-        # 如果已有 page 且未关闭，则复用（load_state 参数在已启动时无效）
-        try:
-            if self.page is not None and not getattr(self.page, "is_closed", lambda: False)():
-                return
-        except Exception:
-            pass
+        # 如果已有 page，需同时确认 browser/context/page 均可用才复用
+        # 否则浏览器可能已意外关闭（如进程被杀、资源释放），复用会报
+        # "Target page, context or browser has been closed"
+        if self.page is not None:
+            page_ok = False
+            try:
+                page_ok = not self.page.is_closed()
+            except Exception:
+                page_ok = False
+
+            browser_ok = False
+            try:
+                if self.browser is not None:
+                    _ = self.browser.version  # 访问属性触发有效性检查
+                    browser_ok = True
+            except Exception:
+                browser_ok = False
+
+            context_ok = False
+            try:
+                if self.context is not None:
+                    self.context.cookies()  # 调用方法触发有效性检查
+                    context_ok = True
+            except Exception:
+                context_ok = False
+
+            if page_ok and browser_ok and context_ok:
+                return  # 三层均可用，正常复用
+
+            # 部分已失效，清理旧实例后重新启动
+            try:
+                self.close()
+            except Exception:
+                pass
+
+        # 如果已有 Playwright 实例但浏览器已关闭，先清理旧实例
+        # 避免多次调用 sync_playwright().start() 导致 asyncio 事件循环冲突
+        if self._playwright is not None:
+            try:
+                self.close()
+            except Exception:
+                pass
 
         # 启动 playwright 并创建 browser/context/page
-        self._playwright = sync_playwright().start()
+        # 捕获 asyncio 错误：如果前一个 Playwright 实例未完全清理，sync API 会报
+        # "It looks like you are using Playwright Sync API inside the asyncio loop"
+        try:
+            self._playwright = sync_playwright().start()
+        except Exception as exc:
+            # 尝试清理后重试一次
+            error_msg = str(exc)
+            if "asyncio" in error_msg.lower() or "sync api" in error_msg.lower():
+                try:
+                    self.close()
+                except Exception:
+                    pass
+                self._playwright = sync_playwright().start()
+            else:
+                raise
+
         headless_env = os.getenv("WEBAGENT_HEADLESS")
         if headless_env is not None:
             headless = headless_env.lower() not in ("0", "false", "no")
         else:
             headless = os.getenv("PWDEBUG") is None
+
+        # 启动浏览器（如果已有 browser 残留则先关闭）
+        if self.browser is not None:
+            try:
+                self.browser.close()
+            except Exception:
+                pass
+            self.browser = None
         self.browser = self._playwright.chromium.launch(headless=headless)
 
         # 根据 load_state 和 state_file 决定是否加载已保存的状态
@@ -110,8 +169,27 @@ class WebBrowser:
         if load_state and self.state_file and Path(self.state_file).exists():
             storage_state_path = self.state_file
 
-        self.context = self.browser.new_context(storage_state=storage_state_path)
-        self.page = self.context.new_page()
+        # 创建 context/page，失败时清理并重试一次（防止浏览器进程意外退出）
+        try:
+            self.context = self.browser.new_context(storage_state=storage_state_path)
+            self.page = self.context.new_page()
+        except Exception:
+            # 创建失败，清理后重试整个浏览器启动流程
+            try:
+                if self.context is not None:
+                    self.context.close()
+            except Exception:
+                pass
+            try:
+                if self.browser is not None:
+                    self.browser.close()
+            except Exception:
+                pass
+            self.context = None
+            self.browser = None
+            self.browser = self._playwright.chromium.launch(headless=headless)
+            self.context = self.browser.new_context(storage_state=storage_state_path)
+            self.page = self.context.new_page()
 
     def save_state(self, path: Optional[str] = None):
         """保存当前浏览器状态（cookies、localStorage、sessionStorage）到文件。

@@ -26,6 +26,9 @@ WebAgent/
 ├── config/
 │   ├── agent_config.json        # 单 Agent prompt 模板与工具元数据配置
 │   └── multi_agent_config.json  # 三 Agent 配置（planner/executor/verifier）
+├── evaluation/                  # 评测系统
+│   ├── evaluator_agent.py       # 评测 Agent（运行用例 + LLM 评估）
+│   └── saucedemo_evaluation_cases.md  # SauceDemo 评测用例文档
 ├── web_traces/
 │   ├── web_agent_trace.jsonl    # 单 Agent 运行 trace 记录
 │   └── multi_agent_trace.jsonl  # 三 Agent 运行 trace 记录
@@ -242,6 +245,64 @@ WebAgent: 使用 Playwright 操作网页。当前架构：单 Agent (REACT)
 - 截图文件保存在 `web_traces/` 目录。
 - 浏览器状态（cookies/localStorage）在任务结束时自动保存到 `web_traces/browser_state.json`，下次运行时由 LLM 决定是否复用。
 
+## 评测系统
+
+项目内置了一套完整的评测系统，用于评估 Agent 在真实网站上的表现。评测系统位于 `evaluation/` 目录。
+
+### 评测流程
+
+```
+加载评测用例 → 运行 Agent → 收集输出 → LLM 评估 → 生成报告
+```
+
+1. **加载评测用例**：从 `EVALUATION_CASES` 内置定义中加载（每个用例包含任务描述、预期结果、评测点）
+2. **运行 Agent**：对每个用例运行 WebAgent（三 Agent 或单 Agent 架构）
+3. **收集输出**：记录 Agent 输出、耗时、步骤数、trace 文件路径
+4. **LLM 评估**：使用 LLM 对照预期结果和评测点，对 Agent 输出进行评分（0-100）
+5. **生成报告**：生成 Markdown 格式的评测报告，包含总体统计和详细结果
+
+### 使用方式
+
+```bash
+# 运行全部用例（三 Agent 架构）
+python evaluation/evaluator_agent.py
+
+# 使用单 Agent 架构
+python evaluation/evaluator_agent.py --single
+
+# 只运行指定用例
+python evaluation/evaluator_agent.py --case 1,3,6
+
+# 指定报告输出路径
+python evaluation/evaluator_agent.py --output evaluation/report.md
+```
+
+### 评测用例
+
+评测用例基于 [SauceDemo](https://www.saucedemo.com/) 测试电商网站，覆盖从简单到复杂的各类网页自动化场景：
+
+| 用例 | 名称 | 难度 | 评测点 |
+|------|------|------|--------|
+| 1 | 成功登录 | 简单 | 打开页面、填写表单、点击按钮、提取信息 |
+| 2 | 登录失败（错误密码） | 简单 | 识别失败、提取错误信息、如实报告 |
+| 3 | 锁定用户登录 | 简单 | 处理登录失败、提取特定错误 |
+| 4 | 商品排序（价格从低到高） | 中等 | 下拉框操作、排序验证、信息提取 |
+| 5 | 添加商品到购物车 | 中等 | 点击按钮、打开购物车、提取商品信息 |
+| 6 | 完整购物流程（结账） | 困难 | 多步骤规划、表单填写、多页面导航、结果验证 |
+| 7 | 商品详情页查看 | 中等 | 点击链接、提取详情信息 |
+| 8 | 退出登录 | 中等 | 菜单操作、退出验证 |
+| 9 | 购物车移除商品 | 中等 | 添加/移除操作、状态验证 |
+| 10 | 问题用户登录后操作 | 中等 | 异常处理、诚实报告 |
+
+### 评测评分标准
+
+| 评分项 | 说明 | 权重 |
+|--------|------|------|
+| 任务完成度 | 是否成功完成目标任务 | 40% |
+| 步骤正确性 | 执行步骤是否合理、无多余操作 | 20% |
+| 异常处理 | 遇到错误/异常时能否正确处理 | 20% |
+| 结果准确性 | 提取的信息是否准确 | 20% |
+
 ## 注意
 
 - 目前只支持公开网页自动化，不支持登录凭据、验证码、支付等敏感操作。
@@ -251,5 +312,6 @@ WebAgent: 使用 Playwright 操作网页。当前架构：单 Agent (REACT)
 
 ## 相关文档
 
-- [docs/LEARNING_AGENT.md](docs/LEARNING_AGENT.md) — 项目深度解析与学习指南
-- [docs/ISSUES_AND_SOLUTIONS.md](docs/ISSUES_AND_SOLUTIONS.md) — 问题记录与解决方案
+- [docs/LEARNING_AGENT.md](docs/LEARNING_AGENT.md) — 项目深度解析与学习指南（含评测系统详解）
+- [docs/ISSUES_AND_SOLUTIONS.md](docs/ISSUES_AND_SOLUTIONS.md) — 问题记录与解决方案（含评测系统问题）
+- [evaluation/saucedemo_evaluation_cases.md](evaluation/saucedemo_evaluation_cases.md) — SauceDemo 评测用例文档
